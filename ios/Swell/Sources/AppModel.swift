@@ -139,7 +139,21 @@ struct TorAuth: OnionAuth {
     }
     func fileURL(_ fileId: String) -> URL? {
         guard !fileId.isEmpty, fileId.allSatisfy({ $0.isHexDigit }), let d = try? filesURL() else { return nil }
-        return d.appendingPathComponent(fileId + ".m4a")
+        let a = d.appendingPathComponent(fileId + ".m4a")
+        return FileManager.default.fileExists(atPath: a.path) ? a : d.appendingPathComponent(fileId + ".dat")
+    }
+
+    /// Upload progress by message id, for the bubble of a photo or file that is being sent.
+    @Published var progress: [String: Int] = [:]
+
+    /// Sends a photo or file. `prepared` photos are already JPEG without EXIF (PhotoPrep).
+    func sendFile(_ data: Data, name: String, mime: String, caption: String = "", to id: String, replyTo: String = "") {
+        Task {
+            guard let engine = await eng() else { return }
+            do { try await engine.sendFile([UInt8](data), name: name, mime: mime, caption: caption, to: id, replyTo: replyTo) }
+            catch { problem = (error as? EngineError).map { "\($0)" } ?? "That could not be sent. \(error.localizedDescription)" }
+            await reload()
+        }
     }
 
     func sendVoice(_ data: Data, ms: Int, to id: String, replyTo: String = "") {
@@ -183,6 +197,7 @@ struct TorAuth: OnionAuth {
                 if let files { await e.setFilesDirectory(files) }
                 let (r, t) = await MainActor.run { (self.receipts, self.typing) }
                 await e.setReceipts(r); await e.setTyping(t)
+                await e.setOnProgress { [weak self] id, p in Task { @MainActor in if p >= 100 { self?.progress[id] = nil } else { self?.progress[id] = p } } }
                 await e.setOnChange { [weak self] in Task { @MainActor in await self?.reload() } }
                 await e.recoverInterrupted()
                 await e.purgeExpired()
@@ -301,7 +316,7 @@ struct TorAuth: OnionAuth {
     func reload() async {
         #if DEBUG
         if CommandLine.arguments.contains("-swellDemo") {
-            contacts = DemoData.contacts()
+            contacts = CommandLine.arguments.contains("-swellEmpty") ? [] : DemoData.contacts()
             if let id = openChat { messages = DemoData.messages(id) }
             return
         }
@@ -534,7 +549,7 @@ struct TorAuth: OnionAuth {
         let ms = await engine.messages(c.id).suffix(8)
         var out = "SWELL chat caps=\(c.caps) waiting=\(c.waiting) name=\(c.displayName) exp=\(c.expireSec) avatar=\(avatars[c.id]?.count ?? 0)\n"
         for m in ms {
-            out += "SWELL  \(m.incoming ? "<" : ">") id=\(m.id.prefix(6)) st=\(m.status.rawValue) dlv=\(m.delivered ? 1 : 0) rd=\(m.read ? 1 : 0) ed=\(m.edited ? 1 : 0) del=\(m.deleted ? 1 : 0) rx=\(m.myReaction)/\(m.theirReaction) re=\(m.replyTo.prefix(6)) v=\(m.voiceMs)\(m.fileId.isEmpty ? "" : "f") \(m.text)\n"
+            out += "SWELL  \(m.incoming ? "<" : ">") id=\(m.id.prefix(6)) st=\(m.status.rawValue) dlv=\(m.delivered ? 1 : 0) rd=\(m.read ? 1 : 0) ed=\(m.edited ? 1 : 0) del=\(m.deleted ? 1 : 0) rx=\(m.myReaction)/\(m.theirReaction) re=\(m.replyTo.prefix(6)) v=\(m.voiceMs)\(m.fileId.isEmpty ? "" : "f:\(m.fileMime):\(m.fileSize)") \(m.text)\n"
         }
         if out != lastDump { lastDump = out; fputs(out, stderr) }
     }
@@ -562,6 +577,14 @@ struct TorAuth: OnionAuth {
         if a.contains("-swellAutoDelete"), let q = await engine.messages(id).last(where: { !$0.incoming }) { try? await engine.deleteForEveryone(q.id, in: id) }
         if let p = val("-swellAutoVoice"), let d = FileManager.default.contents(atPath: NSHomeDirectory() + "/Documents/" + p) {
             _ = try? await engine.sendVoice([UInt8](d), durationMs: 3000, to: id)
+        }
+        if let p = val("-swellAutoPhoto"), let d = FileManager.default.contents(atPath: NSHomeDirectory() + "/Documents/" + p), let j = PhotoPrep.jpeg(from: d) {
+            let t1 = Date(); _ = try? await engine.sendFile([UInt8](j), name: PhotoPrep.name(), mime: "image/jpeg", to: id)
+            fputs("SWELL photo \(j.count) bytes sent in \(Date().timeIntervalSince(t1))s\n", stderr)
+        }
+        if let p = val("-swellAutoFile"), let d = FileManager.default.contents(atPath: NSHomeDirectory() + "/Documents/" + p) {
+            let t1 = Date(); _ = try? await engine.sendFile([UInt8](d), name: p, mime: p.hasSuffix(".pdf") ? "application/pdf" : "application/octet-stream", to: id)
+            fputs("SWELL file \(d.count) bytes sent in \(Date().timeIntervalSince(t1))s\n", stderr)
         }
         if a.contains("-swellAutoNote") { _ = try? await engine.send("note test", to: Engine.noteId) }
         if a.contains("-swellAutoCode") { let t = Date(); let r = await myCode(); fputs("SWELL code in \(String(format: "%.4f", Date().timeIntervalSince(t)))s -> \(r.code.map { String($0.prefix(12)) } ?? r.error ?? "?")\n", stderr) }

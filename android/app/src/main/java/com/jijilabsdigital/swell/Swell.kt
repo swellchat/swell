@@ -22,6 +22,7 @@ import com.jijilabsdigital.swell.core.TorControlHost
 import com.jijilabsdigital.swell.core.Attachment
 import com.jijilabsdigital.swell.core.Modify
 import com.jijilabsdigital.swell.core.Receipt
+import com.jijilabsdigital.swell.core.PrivateMessages
 import com.jijilabsdigital.swell.data.Db
 import com.jijilabsdigital.swell.data.Files
 import com.jijilabsdigital.swell.data.StoredMessage
@@ -85,21 +86,130 @@ object Swell : NodeEvents {
         hasAccount.value = account != null
         Notifications.createChannels(app)
         if (account != null) PollWorker.schedule(app)
+        sweepViewOnce()
+        registerScreenOff()
         thread(name = "swell-expire", isDaemon = true) {
+            var tick = 0
             while (true) {
                 if (db.expire(System.currentTimeMillis()) > 0) bump()
-                Thread.sleep(30_000)
+                // Private chats that saw no activity for 5 minutes are wiped, here and on the other phone.
+                if (++tick % 5 == 0) privateStore.idleChats(PRIVATE_IDLE_MS).forEach { wipePrivate(it) }
+                // Short timers (10 s) and the 1-minute view-once countdown need a fine clock while the app is on screen.
+                Thread.sleep(if (foreground) 1_000 else 15_000)
             }
+        }
+    }
+
+    /** Screen locked or turned off: private chats are wiped (wire section 5b). */
+    private fun registerScreenOff() {
+        androidx.core.content.ContextCompat.registerReceiver(
+            app,
+            object : android.content.BroadcastReceiver() {
+                override fun onReceive(context: Context?, intent: Intent?) { wipeAllPrivate() }
+            },
+            android.content.IntentFilter(Intent.ACTION_SCREEN_OFF),
+            androidx.core.content.ContextCompat.RECEIVER_NOT_EXPORTED,
+        )
+    }
+
+    /** A view-once photo whose viewer was open when the app died: it counts as opened, the countdown starts. */
+    private fun sweepViewOnce() {
+        db.openedNotCounting().forEach { m ->
+            db.setVanish(m.id, System.currentTimeMillis() + VIEW_ONCE_GRACE_MS)
+            pendingOpened += m.contactId to m.id
         }
     }
 
     private fun bump() = changes.update { it + 1 }
 
+    private const val PRIVATE_IDLE_MS = 5 * 60_000L
+    /** How long a view-once row stays after the photo was closed (receiver) or opened (sender). */
+    const val VIEW_ONCE_GRACE_MS = 60_000L
+    /** Opened receipts that could not be sent yet (the app died while viewing). */
+    private val pendingOpened = java.util.concurrent.CopyOnWriteArrayList<Pair<String, String>>()
+
+    /** Messages of chats in private mode: memory only, never written anywhere. */
+    val privateStore = PrivateMessages()
+    /** Chats currently in private mode. Memory only. */
+    val privateOn = MutableStateFlow<Set<String>>(emptySet())
+
     // ---------------------------------------------------------------- account
 
-    fun createAccount(): Account = Account.create().also { it.save(db); account = it }
+    fun createAccount(): Account = Account.create().also {
+        it.save(db); account = it
+        db.put("app", "created", System.currentTimeMillis().toString().toByteArray())
+    }
 
-    fun restoreAccount(words: List<String>): Account = Account.restore(words).also { it.save(db); account = it }
+    /** A restored account: the person already has the phrase, so no reminder card. */
+    fun restoreAccount(words: List<String>): Account = Account.restore(words).also { it.save(db); account = it; phraseSaved = true }
+
+    // ------------------------------------------------------------ settings
+
+    private fun flag(key: String, default: Boolean = false): Boolean = db.get("app", key)?.let { it[0].toInt() == 1 } ?: default
+    private fun setFlag(key: String, v: Boolean) = db.put("app", key, byteArrayOf(if (v) 1 else 0))
+
+    /** Link previews: what this phone SENDS (it fetches over Tor and embeds the preview). Off by default. */
+    var linkPreviews: Boolean get() = flag("linkprev"); set(v) = setFlag("linkprev", v)
+    /** Next voice note starts by itself when one ends. */
+    var autoplayVoice: Boolean get() = flag("autoplay", true); set(v) = setFlag("autoplay", v)
+    /** Faint wave pattern behind chats. */
+    var chatWaves: Boolean get() = flag("waves", true); set(v) = setFlag("waves", v)
+    /** Notification content: 0 = nothing (just "New message"), 1 = name only, 2 = name and content. */
+    var notifContent: Int get() = db.get("app", "notifc")?.get(0)?.toInt() ?: 0; set(v) = db.put("app", "notifc", byteArrayOf(v.toByte()))
+    /** Notification sound as a URI string; null = system default, "" = silent. */
+    var notifSound: String? get() = db.get("app", "notifsound")?.let { String(it) }; set(v) { if (v == null) db.delete("app", "notifsound") else db.put("app", "notifsound", v.toByteArray()); Notifications.createChannels(app) }
+    /** Play the sound for a message that arrives while the app is open. */
+    var soundWhileOpen: Boolean get() = flag("soundopen", true); set(v) = setFlag("soundopen", v)
+    /** The recovery phrase can no longer be shown on this phone (only restoring from it remains possible elsewhere). */
+    var phraseHidden: Boolean get() = flag("phrasehidden"); set(v) = setFlag("phrasehidden", v)
+
+    // ------------------------------------------------------------ chat list: pin, mute, archive, mark unread
+
+    class Meta(val pinned: Boolean = false, val mutedUntil: Long = 0, val archived: Boolean = false, val unread: Boolean = false) {
+        val muted: Boolean get() = mutedUntil > System.currentTimeMillis()
+    }
+    private val metas = java.util.concurrent.ConcurrentHashMap<String, Meta>()
+    fun meta(id: String): Meta = metas.getOrPut(id) {
+        db.get("chatmeta", id)?.let { b -> runCatching { com.jijilabsdigital.swell.core.In(b).let { r -> Meta(r.u8() == 1, r.i64(), r.u8() == 1, r.u8() == 1) } }.getOrNull() } ?: Meta()
+    }
+    private fun saveMeta(id: String, m: Meta) {
+        metas[id] = m
+        db.put("chatmeta", id, com.jijilabsdigital.swell.core.Out().u8(if (m.pinned) 1 else 0).i64(m.mutedUntil).u8(if (m.archived) 1 else 0).u8(if (m.unread) 1 else 0).done())
+        bump()
+    }
+    fun setPinned(id: String, v: Boolean) = meta(id).let { saveMeta(id, Meta(v, it.mutedUntil, it.archived, it.unread)) }
+    /** [ms] from now; Long.MAX_VALUE = always; 0 = unmute. */
+    fun setMuted(id: String, ms: Long) = meta(id).let { saveMeta(id, Meta(it.pinned, if (ms == 0L) 0 else if (ms == Long.MAX_VALUE) Long.MAX_VALUE else System.currentTimeMillis() + ms, it.archived, it.unread)) }
+    fun setArchived(id: String, v: Boolean) = meta(id).let { saveMeta(id, Meta(it.pinned, it.mutedUntil, v, it.unread)) }
+    fun setMarkedUnread(id: String, v: Boolean) = meta(id).let { saveMeta(id, Meta(it.pinned, it.mutedUntil, it.archived, v)) }
+
+    /** Appearance: theme id ("system", "navy", "midnight", "light", "mist") and accent index. */
+    data class Look(val theme: String, val accent: Int)
+    val look by lazy { MutableStateFlow(runCatching { Look(db.get("app", "theme")?.let { String(it) } ?: "system", db.get("app", "accent")?.let { it[0].toInt() } ?: 0) }.getOrDefault(Look("system", 0))) }
+    fun setLook(theme: String = look.value.theme, accent: Int = look.value.accent) {
+        db.put("app", "theme", theme.toByteArray()); db.put("app", "accent", byteArrayOf(accent.toByte()))
+        look.value = Look(theme, accent)
+    }
+
+    /** The clipboard was already offered once for a deferred invite on this install. */
+    var clipChecked: Boolean
+        get() = db.get("app", "clipChecked") != null
+        set(v) { if (v) db.put("app", "clipChecked", byteArrayOf(1)) }
+
+    /** The person wrote the recovery phrase down (or restored with it). */
+    var phraseSaved: Boolean
+        get() = db.get("app", "phraseSaved") != null
+        set(v) { if (v) db.put("app", "phraseSaved", byteArrayOf(1)) else db.delete("app", "phraseSaved") }
+
+    /**
+     * The chat list shows the "save your recovery phrase" card after the first chat, or after one day.
+     * Accounts from before this version (no creation time stored) are not nagged.
+     */
+    fun phraseCardDue(hasChats: Boolean): Boolean {
+        if (phraseSaved) return false
+        val created = db.get("app", "created")?.let { String(it).toLongOrNull() } ?: return false
+        return hasChats || System.currentTimeMillis() - created > 24 * 3600_000L
+    }
 
     /** Called when onboarding is finished; starts the connection. */
     fun finishOnboarding(context: Context) {
@@ -203,6 +313,7 @@ object Swell : NodeEvents {
             }
             log("TOR_READY ${(System.nanoTime() - t0) / 1_000_000} ms")
             val socks = tor.socksPort
+            torCtl = ctl; socksPort = socks
             lateinit var n: Node
             val server = InboundServer({ n.handle(it) }, ::log).also { it.start() }
             val host = TorControlHost(ctl, server.port, log = ::log)
@@ -221,6 +332,8 @@ object Swell : NodeEvents {
             log("ONION ${n.onion}")
             _net.value = Net.Online
             ready.countDown()
+            pendingOpened.forEach { (c, id) -> sendOpened(c, id) }
+            pendingOpened.clear()
             bump()
             thread(name = "swell-poll", isDaemon = true) {
                 var waitOffUntil = 0L
@@ -269,7 +382,11 @@ object Swell : NodeEvents {
     // ---------------------------------------------------------------- events from the node
 
     /** Logs only in debug builds: release builds never write codes, addresses or events to logcat (audit M-01). */
-    override fun log(line: String) { if (BuildConfig.DEBUG) Log.i(TAG, line) }
+    override fun log(line: String) { DebugLog.add(line); if (BuildConfig.DEBUG) Log.i(TAG, line) }
+
+    @Volatile private var torCtl: TorControlConnection? = null
+    @Volatile private var socksPort = 0
+    fun torControl(): TorControlConnection? = torCtl
 
     /** A contact redeemed one of our codes; the UI asks the user to check the safety number (audit H-01). */
     val newContactPrompt = MutableStateFlow<String?>(null)
@@ -279,12 +396,22 @@ object Swell : NodeEvents {
     override fun onContact(contact: Contact) = bump()
 
     override fun onMessage(contact: Contact, message: Message) {
-        message.file?.let { f -> f.data?.let { Files.save(f.id, it) } }
-        db.addMessage(message, if (message.incoming) StoredMessage.RECEIVED else StoredMessage.SENT)
+        if (message.isPrivate) { onPrivateMessage(contact, message); return }
+        // View once: the receiver's copy has its own key; the sender keeps nothing at all.
+        val keepFile = !(message.viewOnce && !message.incoming)
+        if (keepFile) message.file?.let { f -> f.data?.let { if (message.viewOnce) Files.saveOnce(f.id, it) else Files.save(f.id, it) } }
+        db.addMessage(message, if (message.incoming) StoredMessage.RECEIVED else StoredMessage.SENT, if (keepFile) message.file?.id else null)
         log((if (message.incoming) "RECV " else "SENT ") + contact.short)
         if (message.incoming) {
             typingFrom.update { it - contact.id }
-            if (openChat != contact.id) Notifications.newMessage(app)
+            val muted = meta(contact.id).muted
+            if (meta(contact.id).archived && !muted) setArchived(contact.id, false)
+            if (!muted) {
+                if (openChat != contact.id || !foreground) {
+                    val preview = message.text.ifBlank { message.file?.let { app.getString(if (it.mime.startsWith("image/")) R.string.photo_plain else R.string.file_plain) } ?: "" }
+                    Notifications.newMessage(app, if (message.viewOnce) Notifications.Kind.VIEW_ONCE else Notifications.Kind.PLAIN, nickname(contact.id).ifBlank { contact.name }, preview)
+                } else if (soundWhileOpen) Notifications.playInApp(app)
+            }
             if (readReceipts) {
                 val id = message.id
                 val open = openChat == contact.id
@@ -293,6 +420,111 @@ object Swell : NodeEvents {
             }
         }
         bump()
+    }
+
+    // ---------------------------------------------------------------- private mode (memory only)
+
+    private fun onPrivateMessage(contact: Contact, message: Message) {
+        // Never to the database, files, caches or notifications' text. The clock is ours for incoming messages.
+        val m = if (message.incoming) message.copy(sentAt = System.currentTimeMillis()) else message
+        privateStore.add(contact.id, m, if (m.incoming) StoredMessage.RECEIVED else StoredMessage.SENT)
+        privateOn.update { it + contact.id }
+        if (m.incoming) {
+            typingFrom.update { it - contact.id }
+            if (!meta(contact.id).muted) {
+                if (openChat != contact.id || !foreground) Notifications.newMessage(app, Notifications.Kind.PRIVATE)
+                else if (soundWhileOpen) Notifications.playInApp(app)
+            }
+        }
+        bump()
+    }
+
+    override fun onControl(contact: Contact, op: Int) {
+        when (op) {
+            Node.CONTROL_ON -> privateOn.update { it + contact.id }
+            Node.CONTROL_OFF -> { privateOn.update { it - contact.id }; privateStore.wipe(contact.id); Notifications.cancelMessages(app) }
+            Node.CONTROL_WIPE -> { privateStore.wipe(contact.id); Notifications.cancelMessages(app) }
+        }
+        bump()
+    }
+
+    /** Messages of the chat in private mode, newest last, as the chat screen shows them. */
+    fun privateMessages(contactId: String): List<StoredMessage> = privateStore.messages(contactId).map { e ->
+        val m = e.message
+        StoredMessage(
+            m.id, contactId, m.text, m.incoming, m.sentAt, 0, e.status,
+            m.file?.id, m.file?.name, m.file?.mime, m.file?.size ?: 0, null, false, false, m.durationMs, m.flags,
+        )
+    }
+
+    /** Turns private mode on or off for a chat. Turning it on needs the other person online. */
+    fun setPrivate(contactId: String, on: Boolean, onError: (String) -> Unit = { toast(it) }) {
+        val n = node
+        if (n == null) { onError(app.getString(R.string.error_offline)); return }
+        pool.execute {
+            val c = n.contact(contactId) ?: return@execute
+            try {
+                n.setPrivateMode(c, on)
+                privateOn.update { if (on) it + contactId else it - contactId }
+                if (!on) { privateStore.wipe(contactId); Notifications.cancelMessages(app) } else privateStore.touch(contactId)
+                bump()
+            } catch (e: Exception) {
+                onMain { onError(if (e.message == "Update needed") app.getString(R.string.update_needed) else app.getString(R.string.private_needs_online)) }
+            }
+        }
+    }
+
+    /** Wipes the chat's private messages here and (best effort) tells the other phone. The mode itself stays on. */
+    fun wipePrivate(contactId: String, notify: Boolean = true) {
+        val had = privateStore.has(contactId)
+        privateStore.wipe(contactId)
+        if (had) { Notifications.cancelMessages(app); bump() }
+        if (notify && contactId in privateOn.value) pool.execute { node?.let { n -> n.contact(contactId)?.let { n.sendWipe(it) } } }
+    }
+
+    /** App in the background, screen locked: every private chat is wiped (also on the other phones). */
+    fun wipeAllPrivate() {
+        // The picker for a private photo is ours: leaving for it is not "leaving".
+        if (pickerOpen) return
+        privateOn.value.forEach { wipePrivate(it) }
+    }
+
+    @Volatile var pickerOpen = false
+
+    fun touchPrivate(contactId: String) = privateStore.touch(contactId)
+
+    // ---------------------------------------------------------------- view once and timers
+
+    /** Opened view-once photos (kept only in memory) that failed to send: retry needs the bytes. */
+    private val onceRetry = java.util.concurrent.ConcurrentHashMap<String, Pair<String, ByteArray>>()
+
+    /**
+     * Opens a received view-once photo: returns its bytes (memory only) and deletes the file and its key right away,
+     * so it cannot be opened again, not even after a crash. Returns null if it was already opened.
+     */
+    fun beginViewOnce(m: StoredMessage): ByteArray? {
+        val id = m.fileId ?: return null
+        if (!m.viewOnce || !m.incoming || m.openedAt > 0) return null
+        val bytes = Files.load(id)
+        db.markOpened(m.id, System.currentTimeMillis())
+        Notifications.cancelMessages(app)
+        bump()
+        return bytes
+    }
+
+    /** The viewer closed: the row disappears in a minute and the sender is told it was opened. */
+    fun endViewOnce(m: StoredMessage) {
+        db.setVanish(m.id, System.currentTimeMillis() + VIEW_ONCE_GRACE_MS)
+        sendOpened(m.contactId, m.id)
+        bump()
+    }
+
+    private fun sendOpened(contactId: String, id: String) = whenOnline { n -> n.contact(contactId)?.let { n.sendOpened(it, id) } }
+
+    /** An incoming message with a per-message timer came on screen: its countdown starts (once). */
+    fun shown(m: StoredMessage) {
+        if (!m.incoming || m.timerSec <= 0 || m.vanishAt > 0) return
+        pool.execute { if (db.startTimer(m.id, System.currentTimeMillis()) > 0) bump() }
     }
 
     // ---------------------------------------------------------------- profile photo and nicknames
@@ -355,7 +587,7 @@ object Swell : NodeEvents {
     }
 
     /** Removes what the app keeps per contact (photo, nickname) when the contact is deleted. */
-    fun forgetContact(id: String) { Files.delete("av_$id"); db.delete("nick", id); nicks.remove(id); stamp(id) }
+    fun forgetContact(id: String) { db.delete("chatmeta", id); metas.remove(id); Files.delete("av_$id"); db.delete("nick", id); nicks.remove(id); stamp(id) }
 
     override fun onReaction(contact: Contact, messageId: String, emoji: String, add: Boolean) {
         val m = db.message(messageId) ?: return
@@ -374,7 +606,18 @@ object Swell : NodeEvents {
     }
 
     override fun onReceipt(contact: Contact, kind: Int, messageIds: List<String>) {
-        db.raiseStatus(messageIds, if (kind == Receipt.READ) StoredMessage.READ else StoredMessage.DELIVERED)
+        val now = System.currentTimeMillis()
+        if (kind == Receipt.OPENED) {
+            // Only our own view-once messages to this contact: the row goes a minute from now, without a trace.
+            messageIds.forEach { id ->
+                val m = db.message(id)
+                if (m != null && !m.incoming && m.viewOnce && m.contactId == contact.id) { db.raiseStatus(listOf(id), StoredMessage.READ); db.setVanish(id, now + VIEW_ONCE_GRACE_MS) }
+            }
+        } else {
+            db.raiseStatus(messageIds, if (kind == Receipt.READ) StoredMessage.READ else StoredMessage.DELIVERED)
+            // The read receipt starts the sender's countdown of a per-message timer, same moment as on the other phone.
+            if (kind == Receipt.READ) db.startTimers(messageIds, now)
+        }
         bump()
     }
 
@@ -465,15 +708,26 @@ object Swell : NodeEvents {
         bump()
     }
 
-    fun send(contactId: String, text: String, replyTo: String? = null) {
+    fun send(contactId: String, text: String, replyTo: String? = null, timerSec: Int = 0) {
         if (contactId == SELF) { saveNote(text, replyTo); return }
         val c = contact(contactId) ?: return
+        if (contactId in privateOn.value) {
+            // Private: nothing is queued or stored; it goes out now, direct, or fails.
+            touchPrivate(contactId)
+            whenOnline({ toast(if (it == "Update needed") app.getString(R.string.update_needed) else app.getString(R.string.private_needs_online)) }) { n ->
+                n.sendText(n.contact(contactId) ?: error("Contact not found."), text, null, Node.FLAG_PRIVATE, timerSec)
+            }
+            return
+        }
         // Shown at once as "sending"; marked sent or failed when the other phone answers.
-        val pending = Message("p" + System.nanoTime(), contactId, text, false, System.currentTimeMillis(), c.expireSec, replyTo = replyTo)
+        val pending = Message("p" + System.nanoTime(), contactId, text, false, System.currentTimeMillis(), c.expireSec, replyTo = replyTo, timerSec = timerSec)
         db.addMessage(pending, StoredMessage.SENDING)
         bump()
         whenOnline({ db.setStatus(pending.id, StoredMessage.FAILED); bump() }) { n ->
-            n.sendText(n.contact(contactId) ?: error("Contact not found."), text, replyTo)
+            val to = n.contact(contactId) ?: error("Contact not found.")
+            // Link previews are built here, over Tor, and only if the setting is on and the contact can show them.
+            val preview = if (linkPreviews && to.supportsLinkPreview && socksPort > 0) Previews.firstUrl(text)?.let { Previews.build(it, socksPort) } else null
+            n.sendText(to, text, replyTo, 0, timerSec, preview)
             db.deleteMessage(pending.id)
             bump()
         }
@@ -491,7 +745,7 @@ object Swell : NodeEvents {
     }
 
     /** True if [m] can still be edited or deleted for everyone by us. */
-    fun canModify(m: StoredMessage): Boolean = !m.incoming && !m.deleted && !m.id.startsWith("p") && m.status != StoredMessage.FAILED &&
+    fun canModify(m: StoredMessage): Boolean = !m.incoming && !m.deleted && !m.isPrivate && !m.viewOnce && !m.id.startsWith("p") && m.status != StoredMessage.FAILED &&
         (m.contactId == SELF || Modify.allowed(Modify.DELETE, true, m.at, System.currentTimeMillis()))
 
     fun canEdit(m: StoredMessage): Boolean = canModify(m) && m.fileId == null && m.text.isNotBlank()
@@ -515,7 +769,10 @@ object Swell : NodeEvents {
         }
     }
 
-    fun deleteForMe(m: StoredMessage) { db.deleteMessage(m.id); bump() }
+    fun deleteForMe(m: StoredMessage) {
+        if (m.isPrivate) privateStore.remove(m.contactId, m.id) else db.deleteMessage(m.id)
+        bump()
+    }
 
     /** Report inbox from the build (Jiji Labs); null when this build has none. */
     private val reportInbox: ReportInbox? by lazy {
@@ -535,35 +792,53 @@ object Swell : NodeEvents {
     }
 
     fun retry(m: StoredMessage) {
+        if (m.viewOnce) {
+            // The sender keeps no copy of a view-once photo; only a failed send still has it, in memory.
+            val (_, data) = onceRetry.remove(m.id) ?: run { db.deleteMessage(m.id); bump(); return }
+            db.deleteMessage(m.id)
+            sendFile(m.contactId, m.fileName ?: "photo.jpg", m.fileMime ?: "image/jpeg", data, "", null, 0, viewOnce = true)
+            return
+        }
         if (m.fileId != null) {
             val data = Files.load(m.fileId) ?: return
             db.deleteMessage(m.id)
-            sendFile(m.contactId, m.fileName ?: "file", m.fileMime ?: "application/octet-stream", data, m.text, m.replyTo, m.durationMs)
+            sendFile(m.contactId, m.fileName ?: "file", m.fileMime ?: "application/octet-stream", data, m.text, m.replyTo, m.durationMs, timerSec = m.timerSec)
             return
         }
         db.deleteMessage(m.id)
-        send(m.contactId, m.text, m.replyTo)
+        send(m.contactId, m.text, m.replyTo, m.timerSec)
     }
 
     /** Upload progress (0–100) of messages being sent, by pending message id. */
     val progress = MutableStateFlow<Map<String, Int>>(emptyMap())
 
     /** Sends a photo or file. Shown at once with progress; marked failed (tap to retry) if it does not go out. */
-    fun sendFile(contactId: String, name: String, mime: String, data: ByteArray, caption: String = "", replyTo: String? = null, durationMs: Int = 0) {
+    fun sendFile(contactId: String, name: String, mime: String, data: ByteArray, caption: String = "", replyTo: String? = null, durationMs: Int = 0,
+                 viewOnce: Boolean = false, timerSec: Int = 0) {
         if (contactId == SELF) { saveNote(caption, replyTo, Attachment("n" + System.nanoTime(), name, mime, data.size.toLong(), data), durationMs); return }
         val c = contact(contactId) ?: return
+        if (contactId in privateOn.value) {
+            touchPrivate(contactId)
+            whenOnline({ toast(if (it == "Update needed") app.getString(R.string.update_needed) else app.getString(R.string.private_needs_online)) }) { n ->
+                n.sendFile(n.contact(contactId) ?: error("Contact not found."), name, mime, data, "", null, durationMs, Node.FLAG_PRIVATE, timerSec)
+            }
+            return
+        }
         val pendingId = "p" + System.nanoTime()
-        Files.save(pendingId, data)
+        val flags = if (viewOnce) Node.FLAG_VIEW_ONCE else 0
+        // A view-once photo is never stored on the sender's phone; a failed send keeps it in memory for "tap to retry".
+        if (viewOnce) onceRetry[pendingId] = name to data else Files.save(pendingId, data)
         db.addMessage(
-            Message(pendingId, contactId, caption, false, System.currentTimeMillis(), c.expireSec, Attachment(pendingId, name, mime, data.size.toLong()), replyTo, durationMs),
-            StoredMessage.SENDING,
+            Message(pendingId, contactId, caption, false, System.currentTimeMillis(), c.expireSec, Attachment(pendingId, name, mime, data.size.toLong()), replyTo, durationMs, flags, timerSec),
+            StoredMessage.SENDING, if (viewOnce) null else pendingId,
         )
         bump()
-        whenOnline({ e -> db.setStatus(pendingId, StoredMessage.FAILED); progress.update { it - pendingId }; bump(); toast(e) }) { n ->
-            n.sendFile(n.contact(contactId) ?: error("Contact not found."), name, mime, data, caption, replyTo, durationMs) { p ->
+        whenOnline({ e -> db.setStatus(pendingId, StoredMessage.FAILED); progress.update { it - pendingId }; bump(); toast(if (e == "Update needed") app.getString(R.string.update_needed) else e) }) { n ->
+            n.sendFile(n.contact(contactId) ?: error("Contact not found."), name, mime, data, caption, replyTo, durationMs, flags, timerSec) { p ->
                 progress.update { it + (pendingId to p) }
             }
             progress.update { it - pendingId }
+            onceRetry.remove(pendingId)
             db.deleteMessage(pendingId)
             bump()
         }

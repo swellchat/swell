@@ -64,7 +64,6 @@ import kotlinx.coroutines.withContext
 @Composable
 fun Onboarding() {
     var step by remember { mutableStateOf("welcome") }
-    var words by remember { mutableStateOf(emptyList<String>()) }
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
     val notifPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {
@@ -76,10 +75,10 @@ fun Onboarding() {
     }
     when (step) {
         "welcome" -> Welcome(
-            onStart = { scope.launch { words = withContext(Dispatchers.IO) { Swell.createAccount().phrase }; step = "phrase" } },
+            // One tap: the account is made now; the recovery phrase is offered later as a gentle card in the chat list.
+            onStart = { scope.launch { withContext(Dispatchers.IO) { Swell.createAccount() }; step = "name" } },
             onRestore = { step = "restore" },
         )
-        "phrase" -> PhraseScreen(words, onDone = { step = "name" })
         "restore" -> RestoreScreen(onBack = { step = "welcome" }, onDone = { step = "name" })
         "name" -> NameScreen(onDone = { finish() })
     }
@@ -127,7 +126,7 @@ private fun Welcome(onStart: () -> Unit, onRestore: () -> Unit) {
 }
 
 @Composable
-private fun PhraseScreen(words: List<String>, onDone: () -> Unit) = Page {
+fun PhraseScreen(words: List<String>, onDone: () -> Unit) = Page {
     var ok by remember { mutableStateOf(false) }
     Text(stringResource(R.string.phrase_title), style = MaterialTheme.typography.headlineSmall)
     Text(stringResource(R.string.phrase_body))
@@ -146,7 +145,7 @@ private fun PhraseScreen(words: List<String>, onDone: () -> Unit) = Page {
         Checkbox(ok, null)
         Text(stringResource(R.string.phrase_confirm))
     }
-    Button(onDone, Modifier.fillMaxWidth().height(52.dp), enabled = ok) { Text(stringResource(R.string.next)) }
+    Button(onDone, Modifier.fillMaxWidth().height(52.dp), enabled = ok) { Text(stringResource(R.string.done)) }
 }
 
 @Composable

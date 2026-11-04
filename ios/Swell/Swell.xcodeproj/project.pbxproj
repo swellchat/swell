@@ -19,6 +19,7 @@
 		A74EF17AF8A517D4E5C90CA4 /* SwellApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 56D87A8B8BD5C12F8BBDE4B3 /* SwellApp.swift */; };
 		BF5F3914947270F09D562C89 /* SwellCore in Frameworks */ = {isa = PBXBuildFile; productRef = 1DA3F022AA6E387CB25F4E28 /* SwellCore */; };
 		C4F03EEDEDCA092E6A3A0380 /* Services.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5DB74983E0950584D12EFB9B /* Services.swift */; };
+		D5B7B6538789A09BC659A87A /* Attach.swift in Sources */ = {isa = PBXBuildFile; fileRef = 84A0BF2DDDF76D26C4D4B334 /* Attach.swift */; };
 		D79DA11F0B357BA0DE1606AC /* TorService.swift in Sources */ = {isa = PBXBuildFile; fileRef = A42F27FD23EBCA2D1CD5715B /* TorService.swift */; };
 		DAF5B33CC6BFB4EB2029FE00 /* ChatView.swift in Sources */ = {isa = PBXBuildFile; fileRef = DEE620489D6647ED453C2C94 /* ChatView.swift */; };
 		DED1AEE47DC718A4CAC4DD1D /* CTor in Embed Frameworks */ = {isa = PBXBuildFile; productRef = F545E20DF5D972BD2E25BEF1 /* CTor */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
@@ -50,6 +51,7 @@
 		5DB74983E0950584D12EFB9B /* Services.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Services.swift; sourceTree = "<group>"; };
 		7029C71D43E3B78E08A53E5F /* TorDynamic */ = {isa = PBXFileReference; lastKnownFileType = folder; name = TorDynamic; path = ../TorDynamic; sourceTree = SOURCE_ROOT; };
 		81B3CF356C4D5495BDFE6F36 /* Swell.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = Swell.entitlements; sourceTree = "<group>"; };
+		84A0BF2DDDF76D26C4D4B334 /* Attach.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Attach.swift; sourceTree = "<group>"; };
 		9F23C1000FF9489364C8B1BF /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		A42F27FD23EBCA2D1CD5715B /* TorService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TorService.swift; sourceTree = "<group>"; };
 		BEFA12B745F3DE770FA68C0B /* ChatListView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatListView.swift; sourceTree = "<group>"; };
@@ -78,6 +80,7 @@
 			isa = PBXGroup;
 			children = (
 				F9CCFBD74115A16C44F70774 /* AppModel.swift */,
+				84A0BF2DDDF76D26C4D4B334 /* Attach.swift */,
 				BEFA12B745F3DE770FA68C0B /* ChatListView.swift */,
 				DEE620489D6647ED453C2C94 /* ChatView.swift */,
 				EDCE7AEC77FEFF0F6A696CC0 /* Info.plist */,
@@ -220,6 +223,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				9231CF245695BEF391B8509D /* AppModel.swift in Sources */,
+				D5B7B6538789A09BC659A87A /* Attach.swift in Sources */,
 				7416036056002CCD95224E24 /* ChatListView.swift in Sources */,
 				DAF5B33CC6BFB4EB2029FE00 /* ChatView.swift in Sources */,
 				3B47CD419033CC85629613B3 /* OnboardingView.swift in Sources */,

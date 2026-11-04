@@ -15,7 +15,7 @@ kotlin {
 
 application {
     mainClass.set("com.jijilabsdigital.swell.mailbox.MainKt")
-    applicationDefaultJvmArgs = listOf("-Xmx96m", "-XX:+UseSerialGC")
+    applicationDefaultJvmArgs = listOf("-XX:MaxRAMPercentage=40")
 }
 
 dependencies {

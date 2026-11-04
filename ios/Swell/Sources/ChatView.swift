@@ -1,4 +1,5 @@
 import SwiftUI
+import AVFoundation
 import SwellCore
 import SwellSignal
 
@@ -14,6 +15,11 @@ struct ChatView: View {
     @State private var typingOff: Task<Void, Never>?
     @StateObject private var recorder = VoiceRecorder()
     @FocusState private var focused: Bool
+    @State private var showAttach = false
+    @State private var picker: AttachKind?
+    @State private var pendingPicker: AttachKind?
+    @State private var cameraDenied = false
+    @State private var attachNote: String?
 
     private var isNote: Bool { contactId == Engine.noteId }
     private var contact: Contact? { model.contacts.first { $0.id == contactId } }
@@ -63,7 +69,7 @@ struct ChatView: View {
         .toolbar {
             ToolbarItem(placement: .principal) {
                 HStack(spacing: 8) {
-                    if isNote { Image(systemName: "note.text").foregroundStyle(Ocean.accent) }
+                    if isNote { Image(systemName: "note.text").accessibilityHidden(true).foregroundStyle(Ocean.accent) }
                     else { Avatar(name: title, size: 28, photo: model.avatars[contactId]) }
                     VStack(spacing: 0) {
                         Text(title).font(.headline).lineLimit(1)
@@ -97,6 +103,35 @@ struct ChatView: View {
         } message: { m in
             Text(!m.incoming && !isNote && !(contact?.supportsV11 ?? false) ? "This contact's app is older, so the message can only be removed from this iPhone." : "")
         }
+        .sheet(isPresented: $showAttach, onDismiss: { picker = pendingPicker; pendingPicker = nil }) {
+            AttachSheet { k in
+                if k == .camera {
+                    let st = AVCaptureDevice.authorizationStatus(for: .video)
+                    if st == .denied || st == .restricted { showAttach = false; cameraDenied = true; return }
+                    if !UIImagePickerController.isSourceTypeAvailable(.camera) { showAttach = false; attachNote = "This iPhone has no camera available."; return }
+                }
+                pendingPicker = k; showAttach = false
+            }
+                .presentationDetents([.height(300)]).presentationDragIndicator(.visible)
+        }
+        .fullScreenCover(item: $picker) { k in
+            switch k {
+            case .photos: PhotoPicker { d in picker = nil; sendPhoto(d) }.ignoresSafeArea()
+            case .camera: CameraPicker { d in picker = nil; sendPhoto(d) }.ignoresSafeArea()
+            case .files: FilePicker { f, note in
+                    picker = nil
+                    if let f { sendPicked(f.data, name: f.name, mime: f.mime) } else if let note { attachNote = note }
+                }.ignoresSafeArea()
+            }
+        }
+        .alert("Not sent", isPresented: Binding(get: { attachNote != nil }, set: { if !$0 { attachNote = nil } })) {
+            Button("OK", role: .cancel) {}
+        } message: { Text(attachNote ?? "") }
+        .onChange(of: model.problem) { _, p in if let p { attachNote = p; model.problem = nil } }
+        .alert("Camera is off", isPresented: $cameraDenied) {
+            Button("Open Settings") { if let u = URL(string: UIApplication.openSettingsURLString) { UIApplication.shared.open(u) } }
+            Button("Cancel", role: .cancel) {}
+        } message: { Text("Allow the camera for Swell in Settings to take photos.") }
         .alert("Microphone is off", isPresented: $recorder.denied) {
             Button("Open Settings") { if let u = URL(string: UIApplication.openSettingsURLString) { UIApplication.shared.open(u) } }
             Button("Cancel", role: .cancel) {}
@@ -108,10 +143,21 @@ struct ChatView: View {
         .onDisappear { model.close(contactId); if recorder.recording { recorder.finish(send: false) }; VoicePlayer.shared.stop(); if typingOff != nil { model.typing(false, in: contactId) } }
     }
 
+    private func sendPhoto(_ d: Data?) {
+        guard let d else { attachNote = "That photo could not be used."; return }
+        sendPicked(d, name: PhotoPrep.name(), mime: "image/jpeg")
+    }
+
+    private func sendPicked(_ d: Data, name: String, mime: String) {
+        let caption = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        model.sendFile(d, name: name, mime: mime, caption: caption, to: contactId, replyTo: replyTo?.id ?? "")
+        draft = ""; replyTo = nil
+    }
+
     private func quote(for m: ChatMessage) -> Quote? {
         guard !m.replyTo.isEmpty else { return nil }
         guard let q = model.messages.first(where: { $0.id == m.replyTo }), !q.deleted else { return Quote(text: "Original message unavailable", mine: false, missing: true) }
-        return Quote(text: q.text, mine: !q.incoming, missing: false)
+        return Quote(text: q.preview, mine: !q.incoming, missing: false)
     }
 
     private var composer: some View {
@@ -121,7 +167,7 @@ struct ChatView: View {
                     Image(systemName: editing != nil ? "pencil" : "arrowshape.turn.up.left").foregroundStyle(Ocean.accent)
                     VStack(alignment: .leading, spacing: 1) {
                         Text(editing != nil ? "Edit message" : (r.incoming ? "Reply to \(title)" : "Reply to yourself")).font(.caption.weight(.semibold)).foregroundStyle(Ocean.accent)
-                        Text(r.text).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                        Text(r.preview).font(.caption).foregroundStyle(.secondary).lineLimit(1)
                     }
                     Spacer()
                     Button { if editing != nil { draft = "" }; replyTo = nil; editing = nil } label: { Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary) }
@@ -142,6 +188,13 @@ struct ChatView: View {
                 }.padding(.horizontal, 16).padding(.vertical, 8)
             } else {
             HStack(alignment: .bottom, spacing: 8) {
+                if editing == nil {
+                    Button { focused = false; showAttach = true } label: {
+                        Image(systemName: "plus").font(.body.weight(.semibold)).foregroundStyle(Ocean.accent)
+                            .frame(width: 38, height: 38).background(Circle().fill(Ocean.card))
+                            .overlay(Circle().stroke(Ocean.hairline, lineWidth: 0.5))
+                    }.accessibilityLabel("Attach")
+                }
                 TextField("Message", text: $draft, axis: .vertical)
                     .font(.body).lineLimit(1...5).focused($focused)
                     .padding(.horizontal, 14).padding(.vertical, 9)
@@ -231,8 +284,13 @@ private struct Bubble: View {
                     if message.deleted {
                         Label("This message was deleted", systemImage: "nosign").font(.subheadline.italic())
                             .foregroundStyle(mine ? Color.white.opacity(0.85) : Color.secondary)
-                    } else if !message.fileId.isEmpty {
+                    } else if message.isVoice {
                         VoiceBubble(message: message, mine: mine)
+                    } else if message.hasFile {
+                        if message.isImage { PhotoBubble(message: message, mine: mine) } else { FileBubble(message: message, mine: mine) }
+                        if !message.text.isEmpty {
+                            Text(message.text).font(.body).foregroundStyle(mine ? Ocean.onAccent : Color.primary).multilineTextAlignment(.leading).textSelection(.enabled)
+                        }
                     } else {
                         Text(message.text).font(.body).foregroundStyle(mine ? Ocean.onAccent : Color.primary)
                             .multilineTextAlignment(.leading).textSelection(.enabled)
@@ -279,7 +337,7 @@ private struct Bubble: View {
                 }
             }
             Button(action: reply) { Label("Reply", systemImage: "arrowshape.turn.up.left") }
-            if message.fileId.isEmpty { Button { UIPasteboard.general.string = message.text } label: { Label("Copy", systemImage: "doc.on.doc") } }
+            if !message.hasFile || !message.text.isEmpty { Button { UIPasteboard.general.string = message.text } label: { Label("Copy", systemImage: "doc.on.doc") } }
             if canEdit { Button(action: edit) { Label("Edit", systemImage: "pencil") } }
         }
         Button(role: .destructive, action: delete) { Label("Delete", systemImage: "trash") }
@@ -449,5 +507,30 @@ private struct ReportSheet: View {
             .interactiveDismissDisabled(sending)
             .task { recent = await model.recentIncoming(contactId, 10) }
         }
+    }
+}
+
+
+enum AttachKind: String, Identifiable { case photos, camera, files; var id: String { rawValue } }
+
+private struct AttachSheet: View {
+    let choose: (AttachKind) -> Void
+    var body: some View {
+        VStack(spacing: 0) {
+            Text("Send").font(.headline).padding(.top, 22).padding(.bottom, 10)
+            row("photo.on.rectangle", "Photos", .photos)
+            row("camera", "Camera", .camera)
+            row("doc", "Files", .files)
+            Spacer(minLength: 0)
+        }
+    }
+    private func row(_ icon: String, _ title: String, _ k: AttachKind) -> some View {
+        Button { choose(k) } label: {
+            HStack(spacing: 14) {
+                Image(systemName: icon).font(.title3).foregroundStyle(Ocean.onAccent).frame(width: 40, height: 40).background(Circle().fill(Ocean.bubble))
+                Text(title).font(.body).foregroundStyle(Color.primary)
+                Spacer()
+            }.padding(.horizontal, 20).padding(.vertical, 8).contentShape(Rectangle())
+        }.buttonStyle(.plain)
     }
 }

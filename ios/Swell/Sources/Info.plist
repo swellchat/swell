@@ -23,7 +23,7 @@
 	<key>ITSAppUsesNonExemptEncryption</key>
 	<false/>
 	<key>NSCameraUsageDescription</key>
-	<string>Swell uses the camera only to scan a Swell code or a safety-number code. Nothing is saved.</string>
+	<string>Swell uses the camera to scan a Swell code or a safety-number code, or to take a photo you choose to send.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Swell uses the microphone only while you record a voice note.</string>
 	<key>NSPhotoLibraryUsageDescription</key>

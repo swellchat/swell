@@ -54,7 +54,8 @@ fun main(args: Array<String>) {
         override fun onModify(contact: Contact, op: Int, messageId: String, text: String) =
             println("MODIFY ${contact.short} ${messageId.take(8)} ${if (op == 1) "delete" else "edit"} $text")
         override fun onReceipt(contact: Contact, kind: Int, messageIds: List<String>) =
-            println("RECEIPT ${contact.short} ${if (kind == 1) "delivered" else "read"} ${messageIds.joinToString(",") { it.take(8) }}")
+            println("RECEIPT ${contact.short} ${when (kind) { 1 -> "delivered"; 3 -> "opened"; else -> "read" }} ${messageIds.joinToString(",") { it.take(8) }}")
+        override fun onControl(contact: Contact, op: Int) = println("CONTROL ${contact.short} ${when (op) { 1 -> "private-on"; 2 -> "private-off"; else -> "wipe" }}")
         override fun onTyping(contact: Contact, typing: Boolean) = println("TYPING ${contact.short} $typing")
         override fun onAvatar(contact: Contact, jpeg: ByteArray?) = println("AVATAR ${contact.short} ${jpeg?.size ?: "removed"}")
         override fun log(line: String) = println("LOG $line")
@@ -63,7 +64,8 @@ fun main(args: Array<String>) {
         override fun onMessage(contact: Contact, message: Message) =
             run {
                 (if (message.incoming) incomingIds else outgoingIds) += message.id
-                val extra = (message.replyTo?.let { " reply=${it.take(8)}" } ?: "") + (if (message.durationMs > 0) " dur=${message.durationMs}" else "")
+                val extra = (message.replyTo?.let { " reply=${it.take(8)}" } ?: "") + (if (message.durationMs > 0) " dur=${message.durationMs}" else "") +
+                    (if (message.viewOnce) " viewonce" else "") + (if (message.isPrivate) " private" else "") + (if (message.timerSec > 0) " timer=${message.timerSec}" else "")
                 println((if (message.incoming) "RECV" else "SENT") + " ${contact.short} id=${message.id.take(8)}$extra ${message.text}")
             }
     }
@@ -156,6 +158,23 @@ fun main(args: Array<String>) {
                         node.sendFile(node.contacts().last(), f.name, "audio/mp4", f.readBytes(), "", durationMs = p.getOrNull(1)?.toInt() ?: 0)
                         println("FILESENT ${f.name} ${f.length()} B")
                     }
+                    // 1.2: view once, per-message timer, private mode
+                    line.startsWith("viewonce ") -> File(line.removePrefix("viewonce ")).let { f ->
+                        node.sendFile(node.contacts().last(), f.name, if (f.name.endsWith(".mp4")) "video/mp4" else "image/jpeg", f.readBytes(), "", flags = Node.FLAG_VIEW_ONCE)
+                        println("FILESENT ${f.name} viewonce")
+                    }
+                    line.startsWith("timer ") -> line.removePrefix("timer ").split(" ", limit = 2).let { (sec, t) -> node.sendText(node.contacts().last(), t, timerSec = sec.toInt()) }
+                    line.startsWith("timerfile ") -> line.removePrefix("timerfile ").split(" ", limit = 2).let { (sec, f) ->
+                        File(f).let { node.sendFile(node.contacts().last(), it.name, "image/jpeg", it.readBytes(), "", timerSec = sec.toInt()) } }
+                    line == "private on" -> node.setPrivateMode(node.contacts().last(), true)
+                    line == "private off" -> node.setPrivateMode(node.contacts().last(), false)
+                    line == "wipe" -> node.sendWipe(node.contacts().last())
+                    line.startsWith("psend ") -> node.sendText(node.contacts().last(), line.removePrefix("psend "), flags = Node.FLAG_PRIVATE)
+                    line.startsWith("pfile ") -> File(line.removePrefix("pfile ")).let { f ->
+                        node.sendFile(node.contacts().last(), f.name, "image/jpeg", f.readBytes(), "", flags = Node.FLAG_PRIVATE)
+                        println("FILESENT ${f.name} private")
+                    }
+                    line.startsWith("opened ") -> node.sendOpened(node.contacts().last(), pick(line.removePrefix("opened "), incomingIds))
                     line == "poll" -> println("POLLED ${node.pollMailbox()}")
                     line.startsWith("file ") -> {
                         val f = File(line.removePrefix("file "))

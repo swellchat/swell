@@ -37,7 +37,6 @@ public actor Engine {
     private var ops: [Int: Task<Void, Never>] = [:]
     private var opSeq = 0
     static let maxMessagesPerContact = 2000
-    static let fileNotice = "open this chat in Swell on Android, or update Swell, to see it"
 
     public var mailboxOnion: String
     /// Delivery/read receipts and typing: off means neither sent nor processed (PROTOCOL.md 5a). Off by default.
@@ -56,8 +55,29 @@ public actor Engine {
     static let maxOfflineFile = 1_500_000, maxPendingPerContact = 2 * 5_000_000 + 240 * 1024
     private var filesDir: URL?
     public func setFilesDirectory(_ u: URL) { filesDir = u; try? FileManager.default.createDirectory(at: u, withIntermediateDirectories: true, attributes: [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication]) }
-    public func fileURL(_ fileId: String) -> URL? { guard let d = filesDir, !fileId.isEmpty, fileId.allSatisfy({ $0.isHexDigit }) else { return nil }; return d.appendingPathComponent(fileId + ".m4a") }
-    private func removeFile(_ fileId: String) { if let u = fileURL(fileId) { try? FileManager.default.removeItem(at: u) } }
+    /// Voice notes keep the ".m4a" name of build 2; everything else is stored as ".dat" (the real name and type are in the message).
+    public func fileURL(_ fileId: String) -> URL? {
+        guard let d = filesDir, !fileId.isEmpty, fileId.allSatisfy({ $0.isHexDigit }) else { return nil }
+        let a = d.appendingPathComponent(fileId + ".m4a")
+        return FileManager.default.fileExists(atPath: a.path) ? a : d.appendingPathComponent(fileId + ".dat")
+    }
+    private func removeFile(_ fileId: String) {
+        guard let d = filesDir, !fileId.isEmpty, fileId.allSatisfy({ $0.isHexDigit }) else { return }
+        try? FileManager.default.removeItem(at: d.appendingPathComponent(fileId + ".m4a"))
+        try? FileManager.default.removeItem(at: d.appendingPathComponent(fileId + ".dat"))
+    }
+    private var onProgress: (@Sendable (String, Int) -> Void)?
+    /// Upload progress (message id, percent 0...100) for photos and files.
+    public func setOnProgress(_ f: (@Sendable (String, Int) -> Void)?) { onProgress = f }
+    /// A file name that is safe to show and to use on disk: no control characters or path separators, at most 120 characters.
+    public static func cleanFileName(_ s: String) -> String {
+        let f = s.unicodeScalars.filter { u in
+            if u == "/" || u == "\\" || u == ":" { return false }
+            switch u.properties.generalCategory { case .control, .format, .lineSeparator, .paragraphSeparator: return false; default: return true }
+        }
+        let n = String(String.UnicodeScalarView(f)).trimmingCharacters(in: .whitespacesAndNewlines)
+        return n.hasPrefix(".") ? String(n.drop(while: { $0 == "." })).prefix(120).description : String(n.prefix(120))
+    }
     private var inboundBuckets: [String: (minute: Int64, n: Int)] = [:]
     public var profileName: String
     /// True while the app is in the foreground: only then are direct connections to a contact's onion tried.
@@ -135,7 +155,7 @@ public actor Engine {
         if keys.count > Engine.maxMessagesPerContact { // per-contact quota: the oldest go first
             for k in keys.sorted().prefix(keys.count - Engine.maxMessagesPerContact) { kv.delete(ns, k) }
         }
-        if m.sentAt >= c.lastAt { c.lastAt = m.sentAt; c.lastText = (m.fileId.isEmpty && m.voiceMs == 0) ? String(m.text.prefix(120)) : "Voice note" }
+        if m.sentAt >= c.lastAt { c.lastAt = m.sentAt; c.lastText = m.preview }
     }
 
     private func updateStatus(_ m: ChatMessage, _ s: ChatMessage.Status) {
@@ -160,7 +180,7 @@ public actor Engine {
                     }
                     if removed {
                         let last = kv.list(ns).compactMap { try? ChatMessage.decode($0.value) }.max { ($0.sentAt, $0.id) < ($1.sentAt, $1.id) }
-                        c.lastText = last.map { String($0.text.prefix(120)) } ?? ""
+                        c.lastText = last.map { $0.preview } ?? ""
                         save(c)
                     }
                 }
@@ -232,6 +252,8 @@ public actor Engine {
 
     /// False once the server answered a WAIT with a rejection (an older mailbox); then `listen` polls every 12 s.
     public private(set) var waitSupported = true
+    /// Queues per WAIT: 64 on a current mailbox; falls back to 8 when the server rejects a bigger one.
+    public private(set) var waitGroupSize = MailboxProtocol.maxWaitQueues
     public var fallbackPollSeconds = 12.0
     public func setFallbackPoll(_ s: Double) { fallbackPollSeconds = s }
     func hasOpenInvites() -> Bool { !openInvites().isEmpty }
@@ -261,8 +283,8 @@ public actor Engine {
                 try? await Task.sleep(nanoseconds: waitSupported ? 3_000_000_000 : UInt64(fallbackPollSeconds * 1_000_000_000)); continue
             }
             let sig = queueSignature()
-            let groups = stride(from: 0, to: secrets.count, by: MailboxProtocol.maxSecretsPerGet).map {
-                Array(secrets[$0..<min($0 + MailboxProtocol.maxSecretsPerGet, secrets.count)])
+            let groups = stride(from: 0, to: secrets.count, by: waitGroupSize).map {
+                Array(secrets[$0..<min($0 + waitGroupSize, secrets.count)])
             }
             await withTaskGroup(of: Void.self) { g in
                 for (i, grp) in groups.enumerated() { g.addTask { await self.waitLoop(grp, lane: "wait\(i)") } }
@@ -291,7 +313,11 @@ public actor Engine {
             do {
                 let req = try MailboxProtocol.waitRequest(secrets: secrets)
                 let r = try await transport.warmRoundTrip(onion: mailboxOnion, request: req, lane: lane, seconds: 45)
-                if r.first.map(Int.init) == MailboxProtocol.rReject { waitSupported = false; return }
+                if r.first.map(Int.init) == MailboxProtocol.rReject {
+                    if secrets.count > MailboxProtocol.maxSecretsPerGet { waitGroupSize = MailboxProtocol.maxSecretsPerGet } // older mailbox: 8 per WAIT
+                    else { waitSupported = false }
+                    return
+                }
                 let items = try MailboxProtocol.parseList(r)
                 var allAcked = true
                 for idx in Set(items.map { $0.index }).sorted() where idx >= 0 && idx < secrets.count {
@@ -429,7 +455,13 @@ public actor Engine {
     private func liveInvites() -> [OpenInvite] { openInvites().filter { millis() - $0.createdAt < Engine.inviteTTLMs } }
 
     /// Whether the mailbox answers PEEK (0x16): nil = not known yet. Remembered across launches.
-    public var peekKnown: Bool? { kv.get("acct", "peek").map { $0 == [1] } }
+    /// A "no" is only believed for 5 minutes (the mailbox may have been updated); a "yes" is kept.
+    public var peekKnown: Bool? {
+        guard let v = kv.get("acct", "peek") else { return nil }
+        if v.first == 1 { return true }
+        if v.count == 9, let t = try? In(Array(v.dropFirst())).i64(), millis() - t < 300_000 { return false }
+        return nil
+    }
 
     /// The code for "My code", at once and without the network: an unshown prepared invite, else the newest
     /// one, else a new one made on the spot (a local key generation, milliseconds). Marks it shown and prepares the next.
@@ -497,7 +529,7 @@ public actor Engine {
             changed()
         } else if probe.first.map(Int.init) == MailboxProtocol.rReject {
             // An older mailbox: no code can be opened by a friend. Remember it, and clean up.
-            try? kv.batch { kv.put("acct", "peek", [0]) }
+            try? kv.batch { kv.put("acct", "peek", [0] + Out().i64(millis()).done()) }
             await clearQueue(secret: i.secret)
             for o in openInvites() { await clearQueue(secret: o.secret); kv.delete("invite", Codec.hex(o.queueId)) }
         }
@@ -701,18 +733,18 @@ public actor Engine {
             var m = m0
             await self.updateStatus(m, .sending); m.status = .sending
             if !m.fileId.isEmpty {
-                await self.retryVoice(&m)
+                await self.retryFile(&m)
             } else {
                 await self.deliver(&m, id: id)
             }
         }
     }
 
-    private func retryVoice(_ m: inout ChatMessage) async {
+    private func retryFile(_ m: inout ChatMessage) async {
         guard let u = fileURL(m.fileId), let d = try? Data(contentsOf: u), let c = loadContact(m.contactId), let fid = try? Codec.unhex(m.fileId) else {
             updateStatus(m, .failed); m.status = .failed; return
         }
-        await deliverVoice(&m, data: [UInt8](d), fileId: fid, contact: c)
+        await deliverFile(&m, data: [UInt8](d), fileId: fid, contact: c)
     }
 
     private func deliver(_ m: inout ChatMessage, id: [UInt8]) async {
@@ -821,23 +853,21 @@ public actor Engine {
                         completeFile(fid, into: &c)
                     }
                 case 8:
-                    // FILE: header like a text, then the file description. Audio (voice notes) is received; other files
-                    // show a notice in this build.
+                    // FILE: header like a text, then the file description (PROTOCOL.md 4, 5a). Trailing fields are optional.
                     let id = Codec.hex(try inner.raw(16)); let at = try inner.i64(); _ = try inner.i32(); let caption = try inner.str()
                     let fid = Codec.hex(try inner.raw(16))
-                    let name = Engine.cleanName(try inner.str(max: 512)); let mime = try inner.str(max: 100)
+                    let name = Engine.cleanFileName(try inner.str(max: 512)); let mime = try inner.str(max: 100)
                     let size = try inner.i64(); let hash = try inner.raw(32); let parts = Int(try inner.i32())
                     var reply: [UInt8] = []; var dur: Int32 = 0
                     if inner.remaining > 0 { reply = (try? inner.bytes(max: 16)) ?? [] }
                     if inner.remaining >= 4 { dur = (try? inner.i32()) ?? 0 }
-                    if mime.hasPrefix("audio/"), size > 0, size <= Int64(Engine.maxFile), parts >= 1, parts <= 105, filesDir != nil {
+                    if size > 0, size <= Int64(Engine.maxFile), parts >= 1, parts <= 105, filesDir != nil {
                         let meta = Out().i64(millis()).raw(try Codec.unhex(id)).i64(at).str(caption).i64(size).raw(hash).i32(Int32(parts))
-                            .bytes(reply.count == 16 ? reply : []).i32(max(0, min(dur, Engine.maxVoiceMs))).done()
+                            .bytes(reply.count == 16 ? reply : []).i32(max(0, min(dur, Engine.maxVoiceMs))).str(name).str(mime).done()
                         kv.put("fmeta.\(c.id)", fid, meta)
                         completeFile(fid, into: &c)
                     } else {
                         for (k, _) in kv.list("fpart.\(c.id)") where k.hasPrefix(fid + ".") { kv.delete("fpart.\(c.id)", k) }
-                        receive(id: id, at: at, text: "\(name.isEmpty ? "Photo or file" : name): \(Engine.fileNotice).", replyTo: "", into: &c)
                     }
                 case 9:
                     let id = Codec.hex(try inner.raw(16)); let emoji = try inner.str(max: 64); let add = try inner.u8() == 1
@@ -900,6 +930,7 @@ public actor Engine {
         let r = In(metaB)
         guard (try? r.i64()) != nil, let rawId = try? r.raw(16), let at = try? r.i64(), let caption = try? r.str(), let size = try? r.i64(),
               let hash = try? r.raw(32), let parts = try? r.i32(), let rt = try? r.bytes(max: 16), let dur = try? r.i32() else { kv.delete("fmeta.\(c.id)", fid); return }
+        let name = r.remaining > 0 ? ((try? r.str(max: 512)) ?? "") : "", mime = r.remaining > 0 ? ((try? r.str(max: 100)) ?? "") : ""
         var data = [UInt8](); data.reserveCapacity(Int(size))
         let ns = "fpart.\(c.id)"
         for i in 0..<Int(parts) {
@@ -909,13 +940,14 @@ public actor Engine {
         for i in 0..<Int(parts) { kv.delete(ns, "\(fid).\(i)") }
         kv.delete("fmeta.\(c.id)", fid)
         guard Int64(data.count) == size, Codec.sha256(data) == hash else { return }
-        let url = dir.appendingPathComponent(fid + ".m4a")
+        let url = dir.appendingPathComponent(fid + (mime.isEmpty || mime.hasPrefix("audio/") ? ".m4a" : ".dat"))
         guard fid.allSatisfy({ $0.isHexDigit }), (try? Data(data).write(to: url, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])) != nil else { return }
         let id = Codec.hex(rawId)
         if kv.list("msg.\(c.id)").contains(where: { (try? ChatMessage.decode($0.value))?.id == id }) { return }
         let t = millis()
         var m = ChatMessage(id: id, contactId: c.id, text: caption, incoming: true, sentAt: min(at, t), status: .received, expiresAt: c.expireSec > 0 ? t + Int64(c.expireSec) * 1000 : 0)
         m.replyTo = rt.count == 16 ? Codec.hex(rt) : ""; m.receivedAt = t; m.fileId = fid; m.voiceMs = dur
+        m.fileName = name; m.fileMime = mime.isEmpty ? "audio/mp4" : mime; m.fileSize = size
         store(m, into: &c)
         if openChat != c.id { c.unread += 1 }
         if receiptsEnabled, c.supportsV11 { pendingDelivered[c.id, default: []].append(rawId) }
@@ -924,12 +956,19 @@ public actor Engine {
     /// Sends a recorded voice note (AAC in an MP4/M4A container, at most 180 s) as a FILE, parts first.
     @discardableResult
     public func sendVoice(_ data: [UInt8], durationMs: Int, to contactId: String, replyTo: String = "") async throws -> ChatMessage {
-        try await track { try await self.sendVoiceImpl(data, durationMs: durationMs, to: contactId, replyTo: replyTo) }
+        let dur = Int32(max(1, min(durationMs, Int(Engine.maxVoiceMs))))
+        return try await track { try await self.sendFileImpl(data, name: "", mime: "audio/mp4", caption: "", durationMs: dur, to: contactId, replyTo: replyTo) }
     }
 
-    private func sendVoiceImpl(_ data: [UInt8], durationMs: Int, to contactId: String, replyTo: String) async throws -> ChatMessage {
-        guard !data.isEmpty, data.count <= Engine.maxFile, filesDir != nil else { throw SwellError.format("voice note size") }
-        let dur = Int32(max(1, min(durationMs, Int(Engine.maxVoiceMs))))
+    /// Sends a photo or file (at most 5,000,000 bytes) as a FILE: parts first, then the message that names it.
+    /// Files above 1.5 MB need the contact to be online. Photos must already be re-encoded without EXIF by the caller.
+    @discardableResult
+    public func sendFile(_ data: [UInt8], name: String, mime: String, caption: String = "", to contactId: String, replyTo: String = "") async throws -> ChatMessage {
+        try await track { try await self.sendFileImpl(data, name: name, mime: mime, caption: caption, durationMs: 0, to: contactId, replyTo: replyTo) }
+    }
+
+    private func sendFileImpl(_ data: [UInt8], name: String, mime: String, caption: String, durationMs: Int32, to contactId: String, replyTo: String) async throws -> ChatMessage {
+        guard !data.isEmpty, data.count <= Engine.maxFile, filesDir != nil else { throw SwellError.format("file size") }
         let fileId = Codec.random(16), id = Codec.random(16), at = millis()
         let fid = Codec.hex(fileId)
         let isNote = contactId == Engine.noteId
@@ -938,20 +977,24 @@ public actor Engine {
             guard c != nil else { throw EngineError.noRoute }
             guard !c!.blocked else { throw EngineError.blocked }
         }
-        guard let url = fileURL(fid) else { throw SwellError.format("files") }
+        let mime = String(mime.prefix(100)), audio = mime.hasPrefix("audio/")
+        let fname = Engine.cleanFileName(name).isEmpty ? (audio ? "voice-\(at).m4a" : "file") : Engine.cleanFileName(name)
+        guard let dir = filesDir else { throw SwellError.format("files") }
+        let url = dir.appendingPathComponent(fid + (audio ? ".m4a" : ".dat"))
         try Data(data).write(to: url, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
-        var m = ChatMessage(id: Codec.hex(id), contactId: contactId, text: "", incoming: false, sentAt: at, status: isNote ? .sentDirect : .sending,
+        var m = ChatMessage(id: Codec.hex(id), contactId: contactId, text: caption, incoming: false, sentAt: at, status: isNote ? .sentDirect : .sending,
                             expiresAt: (c?.expireSec ?? 0) > 0 ? at + Int64(c!.expireSec) * 1000 : 0)
-        m.replyTo = replyTo.count == 32 ? replyTo : ""; m.fileId = fid; m.voiceMs = dur
+        m.replyTo = replyTo.count == 32 ? replyTo : ""; m.fileId = fid; m.voiceMs = durationMs
+        m.fileName = fname; m.fileMime = mime; m.fileSize = Int64(data.count)
         try kv.batch { if isNote { kv.put("msg.\(contactId)", m.key, m.encode()) } else { store(m, into: &c!); save(c!) } }
         changed()
         guard !isNote, let contact = c else { return m }
-        await deliverVoice(&m, data: data, fileId: fileId, contact: contact)
+        await deliverFile(&m, data: data, fileId: fileId, contact: contact)
         return m
     }
 
     /// Parts first (the first one small enough for a mailbox; if it went direct the rest go in big parts), then the FILE message.
-    private func deliverVoice(_ m: inout ChatMessage, data: [UInt8], fileId: [UInt8], contact: Contact) async {
+    private func deliverFile(_ m: inout ChatMessage, data: [UInt8], fileId: [UInt8], contact: Contact) async {
         do {
             var off = 0, i = 0, direct = true
             let total = data.count
@@ -960,17 +1003,21 @@ public actor Engine {
                 let chunk = Array(data[off..<min(total, off + size)])
                 let how = try await sendInner(Out().u8(7).raw(fileId).i32(Int32(i)).bytes(chunk).done(), to: contact, mailbox: size == Engine.partSize)
                 if i == 0 { direct = how == .sentDirect }
-                if !direct && total > Engine.maxOfflineFile { throw EngineError.unreachable("The contact is offline. Voice notes this long need them online.") }
+                if !direct && total > Engine.maxOfflineFile { throw EngineError.unreachable("The contact is offline. Files over 1.5 MB can only be sent while they are online.") }
                 off += chunk.count; i += 1
+                onProgress?(m.id, off * 100 / (total + 1))
             }
             let id = try Codec.unhex(m.id)
-            let hdr = Out().u8(8); msgBody(hdr, id: id, at: m.sentAt, expire: contact.expireSec, text: "")
-            hdr.raw(fileId).str("voice-\(m.sentAt).m4a").str("audio/mp4").i64(Int64(total)).raw(Codec.sha256(data)).i32(Int32(i))
+            let hdr = Out().u8(8); msgBody(hdr, id: id, at: m.sentAt, expire: contact.expireSec, text: m.text)
+            hdr.raw(fileId).str(m.fileName).str(m.fileMime).i64(Int64(total)).raw(Codec.sha256(data)).i32(Int32(i))
+            // A 1.0 reader refuses trailing bytes on FILE: the extras go only to contacts that announced CAP_V11.
             if contact.supportsV11 { hdr.bytes(m.replyTo.count == 32 ? ((try? Codec.unhex(m.replyTo)) ?? []) : []).i32(m.voiceMs) }
             let how = try await sendInner(hdr.done(), to: contact)
             updateStatus(m, how); m.status = how
+            onProgress?(m.id, 100)
         } catch {
             updateStatus(m, .failed); m.status = .failed
+            onProgress?(m.id, 100)
         }
     }
 
@@ -992,7 +1039,7 @@ public actor Engine {
         let base = m.receivedAt > 0 ? m.receivedAt : m.sentAt
         guard millis() - base <= Engine.editWindowMs else { return }
         if op == 1 {
-            removeFile(m.fileId); m.deleted = true; m.text = ""; m.myReaction = ""; m.theirReaction = ""; m.voiceMs = 0; m.fileId = ""
+            removeFile(m.fileId); m.deleted = true; m.text = ""; m.myReaction = ""; m.theirReaction = ""; m.voiceMs = 0; m.fileId = ""; m.fileName = ""; m.fileMime = ""; m.fileSize = 0
         } else {
             guard !text.isEmpty, m.fileId.isEmpty, m.voiceMs == 0 else { return }
             m.text = text; m.edited = true
@@ -1012,7 +1059,7 @@ public actor Engine {
     /// The chat-list preview follows the newest message (after an edit or a delete).
     private func refreshPreview(_ c: inout Contact) {
         let last = kv.list("msg.\(c.id)").compactMap { try? ChatMessage.decode($0.value) }.max { ($0.sentAt, $0.id) < ($1.sentAt, $1.id) }
-        c.lastText = last.map { $0.deleted ? "This message was deleted" : ($0.fileId.isEmpty && $0.voiceMs == 0) ? String($0.text.prefix(120)) : "Voice note" } ?? ""
+        c.lastText = last.map { $0.preview } ?? ""
     }
 
     /// Sends the delivered receipts collected while handling envelopes, and read receipts for the chat on screen.
@@ -1099,7 +1146,7 @@ public actor Engine {
     public func deleteForEveryone(_ messageId: String, in contactId: String) async throws {
         guard var m = find(messageId, in: contactId), !m.incoming, !m.deleted else { return }
         removeFile(m.fileId)
-        m.deleted = true; m.text = ""; m.myReaction = ""; m.theirReaction = ""; m.voiceMs = 0; m.fileId = ""
+        m.deleted = true; m.text = ""; m.myReaction = ""; m.theirReaction = ""; m.voiceMs = 0; m.fileId = ""; m.fileName = ""; m.fileMime = ""; m.fileSize = 0
         try kv.batch {
             write(m)
             if var c = loadContact(contactId) { refreshPreview(&c); save(c) }

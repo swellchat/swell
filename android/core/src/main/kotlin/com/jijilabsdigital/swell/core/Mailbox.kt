@@ -26,7 +26,7 @@ object MailboxProtocol {
     const val CREDS = 0x15
     /** Read the oldest envelope of a queue by queue id; deletes nothing (v3 mailbox invites). */
     const val PEEK = 0x16
-    /** Long poll: answers like GET for up to 8 queues as soon as one has mail, or empty after the wait (iOS foreground). */
+    /** Long poll: answers like GET for up to 64 queues as soon as one has mail, or empty after the wait (iOS foreground). */
     const val WAIT = 0x17
     const val R_OK = 0x80
     const val R_LIST = 0x82
@@ -53,7 +53,10 @@ object MailboxProtocol {
     const val MAX_PEEKS_PER_MIN = 600
     /** Longest WAIT the server honours, and how many queues may be waited on at once (each holds a connection thread). */
     const val MAX_WAIT_MS = 25_000
-    const val MAX_WAITS = 48
+    /** Default cap on parked waiters (the mailbox process can raise or lower it; one waiter holds one connection). */
+    const val MAX_WAITS = 4_000
+    /** Queues per WAIT: 64 since mailbox 1.2 (8 before). GET stays at [MAX_SECRETS_PER_GET]. */
+    const val MAX_SECRETS_PER_WAIT = 64
 
     fun queueId(secret: ByteArray): ByteArray = sha256("swell-queue".toByteArray() + secret)
 
@@ -221,6 +224,8 @@ class MailboxServer(
     private val turn: TurnConfig? = null,
     private val now: () -> Long = System::currentTimeMillis,
     private val credPowBits: Int = MailboxProtocol.CRED_POW_BITS,
+    /** Most parked WAIT requests at once (each costs one connection thread; use virtual threads for thousands). */
+    private val maxWaits: Int = MailboxProtocol.MAX_WAITS,
 ) {
     private val usedCredNonces = ConcurrentHashMap<Long, Long>() // nonce -> minute
     private var credMinute = 0L
@@ -228,49 +233,65 @@ class MailboxServer(
     private var peekMinute = 0L
     private var peekCount = 0
 
-    private class Waiter { var cancelled = false }
-    private val waiting = HashMap<String, Waiter>() // queue -> its single active waiter; guarded by itself
-    private val parked = java.lang.Object()          // monitor for sleeping waiters; PUT notifies it
+    /** One parked WAIT. Its own condition, so a PUT wakes only the waiters of that queue (no thundering herd). */
+    private inner class Waiter {
+        @Volatile var cancelled = false
+        var signalled = false // guarded by [lock]
+        val cond: java.util.concurrent.locks.Condition = lock.newCondition()
+    }
+    // A ReentrantLock, not synchronized/wait: on Java 21 a virtual thread parked in Object.wait pins its carrier thread.
+    private val lock = java.util.concurrent.locks.ReentrantLock()
+    private val waiting = HashMap<String, Waiter>() // queue -> its single active waiter; guarded by [lock]
+    private var activeWaiters = 0                   // distinct parked waiters; guarded by [lock]
+
+    /** Currently parked waiters (for tests and monitoring). */
+    fun waiters(): Int { lock.lock(); try { return activeWaiters } finally { lock.unlock() } }
+
+    private fun wake(queue: String) {
+        lock.lock()
+        try { waiting[queue]?.let { it.signalled = true; it.cond.signal() } } finally { lock.unlock() }
+    }
 
     /**
-     * WAIT: GET for up to 8 queues (same answer layout), but hold the answer until one has an envelope or
-     * [maxWaitMs] (capped) passes. One waiter per queue (a newer WAIT covering the queue makes the older one
-     * answer empty), at most [MailboxProtocol.MAX_WAITS] waiters in total (beyond that: reject, the client
-     * falls back to polling).
+     * WAIT: GET for up to [MailboxProtocol.MAX_SECRETS_PER_WAIT] queues (same answer layout), but hold the answer until
+     * one has an envelope or [maxWaitMs] (capped) passes. One waiter per queue (a newer WAIT covering the queue makes the
+     * older one answer empty), at most [maxWaits] waiters in total (beyond that: reject, the client falls back to polling).
      */
     private fun waitFor(secrets: List<ByteArray>, maxWaitMs: Int): ByteArray {
         val queues = secrets.map { Codec.hex(MailboxProtocol.queueId(it)) }
         val me = Waiter()
-        synchronized(waiting) {
+        lock.lock()
+        try {
             val olds = queues.mapNotNull { waiting[it] }.toSet()
-            if (waiting.values.toSet().size - olds.size >= MailboxProtocol.MAX_WAITS) return reject()
-            olds.forEach { it.cancelled = true }
+            if (activeWaiters - olds.size >= maxWaits) return reject()
+            olds.forEach { it.cancelled = true; it.signalled = true; it.cond.signal() }
             queues.forEach { waiting[it] = me }
-        }
-        synchronized(parked) { parked.notifyAll() }
+            activeWaiters++
+        } finally { lock.unlock() }
         try {
             val deadline = System.nanoTime() + maxWaitMs.coerceIn(0, MailboxProtocol.MAX_WAIT_MS) * 1_000_000L
             var items = ArrayList<Triple<Int, String, ByteArray>>()
-            synchronized(parked) {
-                while (true) {
-                    items = ArrayList()
-                    if (!me.cancelled) {
-                        var budget = MailboxProtocol.MAX_LIST_BYTES
-                        for ((i, q) in queues.withIndex()) {
-                            if (items.size >= MailboxProtocol.MAX_LIST || budget <= 0) break
-                            store.list(q, MailboxProtocol.MAX_LIST - items.size, budget).forEach { (id, b) -> items += Triple(i, id, b); budget -= b.size }
-                        }
+            while (true) {
+                lock.lock(); try { me.signalled = false } finally { lock.unlock() } // anything put after this point signals us
+                items = ArrayList()
+                if (!me.cancelled) {
+                    var budget = MailboxProtocol.MAX_LIST_BYTES
+                    for ((i, q) in queues.withIndex()) {
+                        if (items.size >= MailboxProtocol.MAX_LIST || budget <= 0) break
+                        store.list(q, MailboxProtocol.MAX_LIST - items.size, budget).forEach { (id, b) -> items += Triple(i, id, b); budget -= b.size }
                     }
-                    val left = (deadline - System.nanoTime()) / 1_000_000L
-                    if (items.isNotEmpty() || me.cancelled || left <= 0) break
-                    try { parked.wait(left) } catch (e: InterruptedException) { items = ArrayList(); break }
                 }
+                val left = deadline - System.nanoTime()
+                if (items.isNotEmpty() || me.cancelled || left <= 0) break
+                lock.lock()
+                try { if (!me.signalled) me.cond.awaitNanos(left) } catch (e: InterruptedException) { items = ArrayList(); break } finally { lock.unlock() }
             }
             val o = Out().u8(MailboxProtocol.R_LIST).i32(items.size)
             items.forEach { (i, id, b) -> o.i32(i).str(id).bytes(b) }
             return o.done()
         } finally {
-            synchronized(waiting) { queues.forEach { if (waiting[it] === me) waiting.remove(it) } }
+            lock.lock()
+            try { queues.forEach { if (waiting[it] === me) waiting.remove(it) }; activeWaiters-- } finally { lock.unlock() }
         }
     }
 
@@ -307,7 +328,7 @@ class MailboxServer(
                 val queue = Codec.hex(r.raw(32))
                 val env = r.bytes(MailboxProtocol.MAX_ENVELOPE)
                 r.end()
-                if (store.put(queue, env)) { synchronized(parked) { parked.notifyAll() }; ok() } else reject()
+                if (store.put(queue, env)) { wake(queue); ok() } else reject()
             }
             MailboxProtocol.GET -> {
                 val n = r.i32()
@@ -333,7 +354,7 @@ class MailboxServer(
             }
             MailboxProtocol.WAIT -> {
                 val ms = r.i32(); val n = r.i32()
-                if (n !in 1..MailboxProtocol.MAX_SECRETS_PER_GET) throw IOException("count")
+                if (n !in 1..MailboxProtocol.MAX_SECRETS_PER_WAIT) throw IOException("count")
                 val secrets = List(n) { r.raw(32) }
                 r.end()
                 waitFor(secrets, ms)

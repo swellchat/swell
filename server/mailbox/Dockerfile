@@ -1,4 +1,4 @@
-FROM eclipse-temurin:17-jre-jammy
+FROM eclipse-temurin:21-jre-jammy
 # Tor from the Tor Project repository (current stable, with onion-service proof-of-work), not Ubuntu's old package.
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates wget gnupg \
  && wget -qO- https://deb.torproject.org/torproject.org/A3C4F0F979CAA22CDBA8F512EE8CBC9E886DDD89.asc | gpg --dearmor > /usr/share/keyrings/tor-archive-keyring.gpg \

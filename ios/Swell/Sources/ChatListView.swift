@@ -69,7 +69,7 @@ struct ChatListView: View {
         List {
             NavigationLink(value: Engine.noteId) {
                 HStack(spacing: 14) {
-                    Image(systemName: "note.text").font(.title3).foregroundStyle(.white).frame(width: 50, height: 50).background(Circle().fill(Ocean.bubble))
+                    Image(systemName: "note.text").accessibilityHidden(true).font(.title3).foregroundStyle(.white).frame(width: 50, height: 50).background(Circle().fill(Ocean.bubble))
                     VStack(alignment: .leading, spacing: 3) {
                         Text("Note to Self").font(.headline)
                         Text("Only you can see this chat").font(.subheadline).foregroundStyle(.secondary)

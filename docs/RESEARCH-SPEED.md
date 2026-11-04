@@ -25,7 +25,7 @@ Owner goal: the app opens instantly (no "Getting ready"), and messages between t
 2. [x] Multi-frame streams, `PEEK 0x16`, `WAIT 0x17` (code + tests; deploy pending owner OK).
 3. [ ] Clients: one warm stream per mailbox in the foreground, WAIT loop, sends on the same stream, optimistic UI. iOS + Android in progress.
 4. [ ] Instant open: chat list from local store in < 0.5 s; no "Getting ready" screen; Tor connects silently. iOS + Android in progress.
-5. [ ] Server scale: today `InboundServer` allows 64 connections and `MAX_WAITS` = 48, which is fine for testing but not for launch. Plan:
+5. [x] (code + load test done 2026-11-04; deploy waits for owner OK) Server scale: today `InboundServer` allows 64 connections and `MAX_WAITS` = 48, which is fine for testing but not for launch. Plan:
    - mailbox on Java 21 with virtual threads (the handler blocks during WAIT, so each waiter costs only KBs);
    - a configurable cap of several thousand waiters;
    - a load test with 1,000 simulated waiters within the 256 MB container.
@@ -38,3 +38,11 @@ Owner goal: the app opens instantly (no "Getting ready"), and messages between t
 - Tor GitLab, conflux for onion services deferred: https://gitlab.torproject.org/tpo/core/tor/-/issues/40716
 - Arti 1.4.6 release (conflux groundwork): https://blog-7551d3.pages.torproject.net/arti_1_4_6_released/
 - DarkHorse (research, lower onion-service latency): https://arxiv.org/pdf/2307.02429
+
+## Server scale: load test (2026-11-04, Mac, loopback, no Tor)
+Tool: `android/mailbox` `LoadTool.kt` (real TCP clients, one parked WAIT each, then 200 PUTs at about 200/s; latency = PUT sent until the waiter's answer arrives). Server: the real mailbox `Main` with `-Xmx96m -XX:+UseSerialGC`, JDK 27 (virtual threads; the container image will be Java 21), file store.
+- 1,000 waiters: 0 errors, 200/200 answered, latency p50 22 ms, p95 31 ms, max 32 ms; server heap about 1 MB used, 27 OS threads, process RSS grew 37 MB to 59 MB.
+- 4,000 waiters (the default cap): 0 errors, 200/200, p50 12 ms, p95 27 ms, max 29 ms; heap 9 MB, 27 threads, RSS 39 MB to 83 MB (macOS RSS, includes JVM baseline).
+- 1,000 waiters of 8 queues each: 0 errors, p50 18 ms, p95 31 ms; RSS 70 MB.
+- Same 1,000 waiters on Java 17 platform threads: 817 OS threads (Linux pids_limit is 128, so it would not even start); latency the same.
+These latencies exclude Tor (1 to 3 s per hop path in production). Caps are `MAILBOX_MAX_CONNECTIONS` (6000) and `MAILBOX_MAX_WAITS` (4000); WAIT takes up to 64 queues. The 256 MB container also holds Tor, so the practical ceiling will be Tor's memory per circuit, not the mailbox. Check after deploy with `docker stats`.

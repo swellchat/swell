@@ -26,6 +26,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -61,6 +62,7 @@ val QUICK_REACTIONS = listOf("👍", "❤️", "😂", "😮", "😢", "🙏")
 @Composable
 fun previewText(m: StoredMessage): String = when {
     m.deleted -> stringResource(R.string.msg_deleted)
+    m.viewOnce -> stringResource(R.string.view_once_photo)
     m.isVoice -> "🎤 " + stringResource(R.string.voice_message)
     m.fileId == null -> m.text
     m.text.isNotBlank() -> (if (m.isImage) "🖼 " else "📎 ") + m.text
@@ -108,7 +110,7 @@ fun ReactionChips(m: StoredMessage, list: List<Reaction>, modifier: Modifier = M
         list.groupBy { it.emoji }.entries.sortedByDescending { it.value.size }.forEach { (emoji, who) ->
             val mine = who.any { it.who == Db.ME }
             Row(
-                Modifier.clip(RoundedCornerShape(12.dp))
+                Modifier.minimumInteractiveComponentSize().clip(RoundedCornerShape(12.dp))
                     .background(if (mine) Ocean.Electric.copy(alpha = 0.35f) else Ocean.Raised)
                     .clickable { Swell.react(m, emoji) }.padding(horizontal = 8.dp, vertical = 3.dp),
                 verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(3.dp),
@@ -141,7 +143,7 @@ fun VoiceRow(m: StoredMessage) {
         if (value == 0) value = withContext(Dispatchers.IO) { m.fileId?.let { Files.load(it) }?.let { audioDurationMs(it) } ?: 0 }
     }
     Row(Modifier.widthIn(min = 200.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-        Box(Modifier.size(40.dp).clip(CircleShape).background(Color.White.copy(alpha = 0.2f)).clickable {
+        Box(Modifier.size(48.dp).clip(CircleShape).background(androidx.compose.material3.LocalContentColor.current.copy(alpha = 0.18f)).clickable {
             val id = m.fileId ?: return@clickable
             scope.launch {
                 val bytes = withContext(Dispatchers.IO) { Files.load(id) } ?: return@launch
@@ -156,7 +158,7 @@ fun VoiceRow(m: StoredMessage) {
         Column(Modifier.weight(1f)) {
             LinearProgressIndicator(
                 progress = { if (active) progress else 0f }, Modifier.fillMaxWidth().height(4.dp).clip(CircleShape),
-                color = Color.White, trackColor = Color.White.copy(alpha = 0.3f),
+                color = androidx.compose.material3.LocalContentColor.current, trackColor = androidx.compose.material3.LocalContentColor.current.copy(alpha = 0.3f),
             )
             Text(
                 if (length > 0) formatDuration(length) else stringResource(R.string.voice_message),

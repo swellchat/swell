@@ -18,6 +18,7 @@ struct SwellApp: App {
             .tint(Ocean.accent)
             .preferredColorScheme(Debug.has("-swellLight") ? .light : nil)
             .onChange(of: phase, initial: true) { _, p in model.scene(p) }
+            .onAppear { if Debug.has("-swellTrace") { UIApplication.shared.isIdleTimerDisabled = true } }
             .onOpenURL { model.handleLink($0) }
             .onContinueUserActivity(NSUserActivityTypeBrowsingWeb) { if let u = $0.webpageURL { model.handleLink(u) } }
             .alert("Add this contact?", isPresented: Binding(get: { model.pendingInvite != nil && model.stage == .ready }, set: { if !$0 { model.pendingInvite = nil } })) {

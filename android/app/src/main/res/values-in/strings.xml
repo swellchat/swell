@@ -190,6 +190,45 @@
     <string name="welcome_p4">Gratis. Tanpa iklan. Tanpa pelacakan.</string>
     <string name="more_options">Opsi lain</string>
     <string name="copy_code">Salin kode</string>
-    <string name="legal_notice">Swell adalah perangkat lunak bebas berlisensi GNU AGPL-3.0, tanpa jaminan apa pun. Hak cipta PT JIJI LABS DIGITAL dan para pembuat perangkat lunak yang disertakan.</string>
-    <string name="legal_source">Kode sumber dan lisensi</string>
+    <!-- 1.2: sekali lihat, timer pesan, mode pribadi -->
+    <string name="notif_view_once">Foto sekali lihat</string>
+    <string name="notif_private">Pesan pribadi baru</string>
+    <string name="update_needed">Perlu pembaruan</string>
+    <string name="private_needs_online">Pesan pribadi butuh lawan bicara sedang online.</string>
+    <string name="view_once_photo">Foto sekali lihat</string>
+    <string name="view_once_video">Video sekali lihat</string>
+    <string name="view_once_open">Ketuk untuk membuka sekali</string>
+    <string name="view_once_opened">Sudah dibuka</string>
+    <string name="view_once_sent_hint">Hilang setelah dibuka</string>
+    <string name="view_once_notice">Pengirim akan melihat bahwa kamu membukanya. Tidak bisa dibuka lagi.</string>
+    <string name="attach_view_once">Foto sekali lihat</string>
+    <string name="attach_update_needed">Foto sekali lihat (perlu pembaruan)</string>
+    <string name="timer_button">Timer pesan</string>
+    <string name="timer_10s">10 detik</string>
+    <string name="timer_1m">1 menit</string>
+    <string name="timer_1h">1 jam</string>
+    <string name="timer_1d">1 hari</string>
+    <string name="timer_update_needed">Timer pesan (perlu pembaruan)</string>
+    <string name="timer_ring">Segera hilang</string>
+    <string name="private_mode">Mode pribadi</string>
+    <string name="private_banner">Mode pribadi · tidak ada yang disimpan</string>
+    <string name="private_toggle_on">Nyalakan mode pribadi</string>
+    <string name="private_toggle_off">Matikan mode pribadi</string>
+    <string name="private_update_needed">Mode pribadi butuh aplikasi yang diperbarui di ponsel lawan bicara.</string>
+    <string name="private_hint">Pesan hanya ada di memori. Dihapus saat salah satu keluar dari chat, pindah aplikasi, mengunci layar, atau 5 menit tanpa aktivitas.</string>
+    <string name="private_chat_empty">Tidak ada yang disimpan di chat ini.</string>
+    <string name="time_now">baru saja</string>
+    <string name="phrase_card_title">Simpan frasa pemulihanmu</string>
+    <string name="phrase_card_body">Ini satu-satunya cara mengembalikan chatmu di ponsel baru. Hanya satu menit.</string>
+    <string name="phrase_card_action">Simpan sekarang</string>
+    <string name="done">Selesai</string>
+
+    <string name="clip_invite_title">Terhubung dengan orang yang mengundangmu?</string>
+    <string name="clip_invite_body">Kamu membuka Swell dari tautan undangan. Dengan terhubung, mereka bisa mengirim pesan ke kamu.</string>
+    <string name="not_now">Nanti saja</string>
+    <string name="tick_sent">Terkirim</string>
+    <string name="tick_delivered">Sampai</string>
+    <string name="tick_read">Dibaca</string>
+    <string name="photo_plain">Foto</string>
+    <string name="file_plain">Berkas</string>
 </resources>

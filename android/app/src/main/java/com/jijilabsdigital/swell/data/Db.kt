@@ -84,7 +84,22 @@ class StoredMessage(
     val deleted: Boolean = false,
     /** Voice note length in milliseconds. */
     val durationMs: Int = 0,
+    /** [com.jijilabsdigital.swell.core.Node.FLAG_VIEW_ONCE] / FLAG_PRIVATE. */
+    val flags: Int = 0,
+    /** Per-message timer in seconds, 0 = none. */
+    val timerSec: Int = 0,
+    /** When the message vanishes (ms), 0 = not started. */
+    val vanishAt: Long = 0,
+    /** View once: the viewer was opened at this time (0 = never). */
+    val openedAt: Long = 0,
+    /** Outgoing: when the delivered / read receipt arrived (0 = not yet or receipts off). */
+    val deliveredAt: Long = 0,
+    val readAt: Long = 0,
+    /** Link preview card (wire section 5c), built by the sender. */
+    val preview: com.jijilabsdigital.swell.core.LinkPreview? = null,
 ) {
+    val viewOnce: Boolean get() = flags and 1 != 0
+    val isPrivate: Boolean get() = flags and 2 != 0
     val isImage: Boolean get() = fileMime?.startsWith("image/") == true
     val isVoice: Boolean get() = fileMime?.startsWith("audio/") == true
 
@@ -137,6 +152,9 @@ class Db private constructor(private val file: File, private val db: SQLiteDatab
         db.insertWithOnConflict("messages", null, ContentValues().apply {
             put("id", m.id); put("contact", m.contactId); put("text", m.text); put("incoming", if (m.incoming) 1 else 0)
             m.replyTo?.let { put("reply_to", it) }
+            if (m.flags != 0) put("flags", m.flags)
+            if (m.timerSec > 0) put("timer", m.timerSec)
+            m.preview?.let { put("preview", it.encode()) }
             if (m.durationMs > 0) put("duration", m.durationMs)
             m.file?.let { f -> put("file_id", fileId); put("file_name", f.name); put("file_mime", f.mime); put("file_size", f.size) }
             // Incoming messages expire by local receive time, so a wrong clock on the other phone cannot keep them.
@@ -152,10 +170,13 @@ class Db private constructor(private val file: File, private val db: SQLiteDatab
         c.getString(0), c.getString(1), c.getString(2), c.getInt(3) == 1, c.getLong(4), c.getInt(5), c.getInt(6),
         c.getString(7), c.getString(8), c.getString(9), c.getLong(10),
         c.getString(11), c.getInt(12) == 1, c.getInt(13) == 1, c.getInt(14),
+        c.getInt(15), c.getInt(16), c.getLong(17), c.getLong(18), c.getLong(19), c.getLong(20),
+        c.getBlob(21)?.let { com.jijilabsdigital.swell.core.LinkPreview.decode(it) },
     )
 
     private val cols = "id, contact, text, incoming, at, expire, status, file_id, file_name, file_mime, IFNULL(file_size, 0), " +
-        "reply_to, IFNULL(edited, 0), IFNULL(deleted, 0), IFNULL(duration, 0)"
+        "reply_to, IFNULL(edited, 0), IFNULL(deleted, 0), IFNULL(duration, 0), " +
+        "IFNULL(flags, 0), IFNULL(timer, 0), IFNULL(vanish_at, 0), IFNULL(opened_at, 0), IFNULL(delivered_at, 0), IFNULL(read_at, 0), preview"
 
     fun messages(contactId: String): List<StoredMessage> =
         db.rawQuery("SELECT $cols FROM messages WHERE contact=? ORDER BY at, rowid", arrayOf(contactId)).use { c ->
@@ -224,15 +245,25 @@ class Db private constructor(private val file: File, private val db: SQLiteDatab
     /** Raises the status of outgoing messages (sent < delivered < read); never lowers it. */
     fun raiseStatus(ids: Collection<String>, status: Int) {
         ids.chunked(500).forEach { part ->
-            val args: Array<Any?> = arrayOf(status, status, *part.toTypedArray())
-            db.execSQL("UPDATE messages SET status=? WHERE incoming=0 AND status<? AND status IN (1,4) AND id IN (${part.joinToString(",") { "?" }})", args)
+            val now = System.currentTimeMillis()
+            val args: Array<Any?> = arrayOf(status, now, status, now, status, *part.toTypedArray())
+            db.execSQL(
+                "UPDATE messages SET status=?, delivered_at=IFNULL(delivered_at, ?), read_at=CASE WHEN ?=${StoredMessage.READ} THEN IFNULL(read_at, ?) ELSE read_at END " +
+                    "WHERE incoming=0 AND status<? AND status IN (1,4) AND id IN (${part.joinToString(",") { "?" }})", args,
+            )
         }
     }
 
     /** Incoming messages of a chat we have not yet marked as read. */
     fun unread(contactId: String): List<String> =
-        db.rawQuery("SELECT id FROM messages WHERE contact=? AND incoming=1 AND status=?", arrayOf(contactId, StoredMessage.RECEIVED.toString())).use { c ->
+        db.rawQuery("SELECT id FROM messages WHERE contact=? AND incoming=1 AND IFNULL(flags, 0) & 1 = 0 AND status=?", arrayOf(contactId, StoredMessage.RECEIVED.toString())).use { c ->
             buildList { while (c.moveToNext()) add(c.getString(0)) }
+        }
+
+    /** Unread incoming messages per chat (the accent badge in the chat list). */
+    fun unreadCounts(): Map<String, Int> =
+        db.rawQuery("SELECT contact, COUNT(*) FROM messages WHERE incoming=1 AND status=? AND IFNULL(deleted, 0)=0 GROUP BY contact", arrayOf(StoredMessage.RECEIVED.toString())).use { c ->
+            buildMap { while (c.moveToNext()) put(c.getString(0), c.getInt(1)) }
         }
 
     fun markSeen(ids: Collection<String>) {
@@ -254,8 +285,56 @@ class Db private constructor(private val file: File, private val db: SQLiteDatab
         }
     }
 
-    /** Deletes disappearing messages (and their files) whose time is up. Returns how many were deleted. */
-    fun expire(now: Long): Int = deleteWhere("expire > 0 AND at + expire * 1000 < CAST(? AS INTEGER)", arrayOf(now.toString()))
+    /**
+     * Deletes disappearing messages (and their files) whose time is up: the chat timer, a started per-message
+     * timer or view-once countdown, and items nobody opened for [UNOPENED_MS]. No placeholder is left. Returns how many.
+     */
+    fun expire(now: Long): Int {
+        val n = now.toString()
+        val gone = deleteWhere(
+            // CAST: a text parameter compared with an arithmetic expression (no column affinity) would always win.
+            "(expire > 0 AND at + expire * 1000 < CAST(?1 AS INTEGER)) OR (IFNULL(vanish_at, 0) > 0 AND vanish_at < CAST(?1 AS INTEGER)) OR " +
+                "((IFNULL(flags, 0) & 1 != 0 OR IFNULL(timer, 0) > 0) AND IFNULL(vanish_at, 0) = 0 AND at + ${UNOPENED_MS} < CAST(?1 AS INTEGER))",
+            arrayOf(n),
+        )
+        if (gone > 0) pruneReactions()
+        return gone
+    }
+
+    /** Receiver: the message was shown; its per-message timer starts now (once). Returns the vanish time or 0. */
+    fun startTimer(id: String, now: Long): Long = message(id)?.let { m ->
+        if (m.timerSec <= 0 || m.vanishAt > 0) return 0
+        val at = now + m.timerSec * 1000L
+        db.update("messages", ContentValues().apply { put("vanish_at", at) }, "id=? AND IFNULL(vanish_at, 0)=0", arrayOf(id))
+        at
+    } ?: 0
+
+    /** Sets the time a message vanishes (view-once countdown after closing/opening receipt). Only if not set yet. */
+    fun setVanish(id: String, at: Long) {
+        db.update("messages", ContentValues().apply { put("vanish_at", at) }, "id=? AND IFNULL(vanish_at, 0)=0", arrayOf(id))
+    }
+
+    /** Outgoing messages with a per-message timer whose read receipt just arrived: the countdown starts now. */
+    fun startTimers(ids: Collection<String>, now: Long) {
+        ids.chunked(500).forEach { part ->
+            db.execSQL(
+                "UPDATE messages SET vanish_at = ? + timer * 1000 WHERE incoming=0 AND IFNULL(timer, 0) > 0 AND IFNULL(vanish_at, 0)=0 AND id IN (${part.joinToString(",") { "?" }})",
+                arrayOf<Any?>(now, *part.toTypedArray()),
+            )
+        }
+    }
+
+    /** View once opened: the file is gone for good (row stays for the last minute, without content). */
+    fun markOpened(id: String, at: Long) {
+        fileIds("id=?", arrayOf(id)).forEach { Files.delete(it) }
+        db.update("messages", ContentValues().apply { put("opened_at", at); putNull("file_id") }, "id=?", arrayOf(id))
+    }
+
+    /** View-once items the viewer was opened for but whose countdown never started (the app died while viewing). */
+    fun openedNotCounting(): List<StoredMessage> =
+        db.rawQuery("SELECT $cols FROM messages WHERE IFNULL(opened_at, 0) > 0 AND IFNULL(vanish_at, 0) = 0", null).use { c ->
+            buildList { while (c.moveToNext()) add(row(c)) }
+        }
 
     /** Wipes the database file and its key. */
     fun destroy(context: Context) {
@@ -267,6 +346,7 @@ class Db private constructor(private val file: File, private val db: SQLiteDatab
 
     companion object {
         const val ME = "me"
+        const val UNOPENED_MS = 14L * 86400 * 1000
         /** Removes the database and its key without opening it (used when the key cannot be unwrapped). */
         fun wipe(context: Context) {
             java.io.File(context.filesDir, "att").deleteRecursively()
@@ -291,8 +371,10 @@ class Db private constructor(private val file: File, private val db: SQLiteDatab
             db.execSQL("CREATE INDEX IF NOT EXISTS messages_contact ON messages (contact, at)")
             // v2: attachments. ADD COLUMN fails harmlessly when the column exists.
             // v3 (1.1): reply, edited, deleted, voice length.
+            // v4 (1.2): flags (view once), timer (per message), vanish_at and opened_at (countdowns).
             listOf("file_id TEXT", "file_name TEXT", "file_mime TEXT", "file_size INTEGER",
-                "reply_to TEXT", "edited INTEGER", "deleted INTEGER", "duration INTEGER").forEach { col ->
+                "reply_to TEXT", "edited INTEGER", "deleted INTEGER", "duration INTEGER",
+                "flags INTEGER", "timer INTEGER", "vanish_at INTEGER", "opened_at INTEGER", "delivered_at INTEGER", "read_at INTEGER", "preview BLOB").forEach { col ->
                 runCatching { db.execSQL("ALTER TABLE messages ADD COLUMN $col") }
             }
             db.execSQL("CREATE TABLE IF NOT EXISTS reactions (msg TEXT NOT NULL, who TEXT NOT NULL, emoji TEXT NOT NULL, PRIMARY KEY (msg, who))")

@@ -7,6 +7,8 @@ public enum MailboxProtocol {
     public static let version = 2
     public static let put = 0x11, get = 0x12, ack = 0x13, create = 0x14, creds = 0x15, peek = 0x16, wait = 0x17
     public static let maxWaitMs = 25_000
+    /// A newer mailbox accepts up to 64 queues in one WAIT; an older one only 8 (and rejects more).
+    public static let maxWaitQueues = 64
     public static let rOK = 0x80, rList = 0x82, rCreds = 0x83, rReject = 0xFF
     public static let maxEnvelope = 80 * 1024
     public static let maxSecretsPerGet = 8
@@ -100,7 +102,7 @@ public enum MailboxProtocol {
     public static func peekRequest(queueId: [UInt8]) -> [UInt8] { Out().u8(version).u8(peek).raw(queueId).done() }
     /// Long poll for up to 8 queues: answers like GET as soon as one has mail, or empty after `maxWaitMs`.
     public static func waitRequest(secrets: [[UInt8]], maxWaitMs: Int = maxWaitMs) throws -> [UInt8] {
-        guard (1...maxSecretsPerGet).contains(secrets.count) else { throw SwellError.format("count") }
+        guard (1...maxWaitQueues).contains(secrets.count) else { throw SwellError.format("count") }
         let o = Out().u8(version).u8(wait).i32(Int32(max(0, min(maxWaitMs, Self.maxWaitMs)))).i32(Int32(secrets.count))
         secrets.forEach { o.raw($0) }
         return o.done()

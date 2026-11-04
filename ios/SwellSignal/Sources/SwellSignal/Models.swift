@@ -83,8 +83,23 @@ public struct ChatMessage: Identifiable, Equatable, Sendable {
     /// Voice note length in ms (0 = not a voice note) and the id of its audio file.
     public var voiceMs: Int32 = 0
     public var fileId = ""
+    /// Attached photo or file: name, MIME type and size in bytes (empty/0 for old voice notes and text).
+    public var fileName = ""
+    public var fileMime = ""
+    public var fileSize: Int64 = 0
     /// When this phone got an incoming message (the edit/delete window runs from here).
     public var receivedAt: Int64 = 0
+
+    public var hasFile: Bool { !fileId.isEmpty }
+    public var isVoice: Bool { hasFile && (fileMime.isEmpty || fileMime.hasPrefix("audio/")) }
+    public var isImage: Bool { hasFile && fileMime.hasPrefix("image/") }
+    /// One-line description for the chat list and quotes.
+    public var preview: String {
+        if deleted { return "This message was deleted" }
+        if isVoice { return "Voice note" }
+        if hasFile { return text.isEmpty ? (isImage ? "Photo" : (fileName.isEmpty ? "File" : fileName)) : String(text.prefix(120)) }
+        return String(text.prefix(120))
+    }
 
     var key: String { String(format: "%015lld", sentAt) + id }
     /// Delivered to the contact's phone: directly, or confirmed by a receipt after it waited in their mailbox.
@@ -94,7 +109,7 @@ public struct ChatMessage: Identifiable, Equatable, Sendable {
         let flags: Int = (edited ? 1 : 0) | (deleted ? 2 : 0) | (delivered ? 4 : 0) | (read ? 8 : 0)
         return Out().u8(1).str(id).str(contactId).str(text).u8(incoming ? 1 : 0).i64(sentAt).u8(status.rawValue).i64(expiresAt)
             .bytes(replyTo.count == 32 ? ((try? Codec.unhex(replyTo)) ?? []) : []).u8(flags).str(myReaction).str(theirReaction)
-            .i32(voiceMs).str(fileId).i64(receivedAt).done()
+            .i32(voiceMs).str(fileId).i64(receivedAt).str(fileName).str(fileMime).i64(fileSize).done()
     }
     static func decode(_ b: [UInt8]) throws -> ChatMessage {
         let r = In(b)
@@ -106,6 +121,7 @@ public struct ChatMessage: Identifiable, Equatable, Sendable {
             let f = try r.u8(); m.edited = f & 1 != 0; m.deleted = f & 2 != 0; m.delivered = f & 4 != 0; m.read = f & 8 != 0
             m.myReaction = try r.str(max: 64); m.theirReaction = try r.str(max: 64)
             m.voiceMs = try r.i32(); m.fileId = try r.str(max: 64); m.receivedAt = try r.i64()
+            if r.remaining > 0 { m.fileName = try r.str(max: 512); m.fileMime = try r.str(max: 100); m.fileSize = try r.i64() }
         }
         return m
     }

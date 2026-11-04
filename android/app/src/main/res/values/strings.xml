@@ -191,6 +191,45 @@
     <string name="welcome_p4">Free. No ads. No tracking.</string>
     <string name="more_options">More options</string>
     <string name="copy_code">Copy code</string>
-    <string name="legal_notice">Swell is free software under the GNU AGPL-3.0 and comes with no warranty. Copyright PT JIJI LABS DIGITAL and the authors of the included software.</string>
-    <string name="legal_source">Source code and licenses</string>
+    <!-- 1.2: view once, message timer, private mode -->
+    <string name="notif_view_once">View-once photo</string>
+    <string name="notif_private">New private message</string>
+    <string name="update_needed">Update needed</string>
+    <string name="private_needs_online">Private messages need the other person online.</string>
+    <string name="view_once_photo">View-once photo</string>
+    <string name="view_once_video">View-once video</string>
+    <string name="view_once_open">Tap to open once</string>
+    <string name="view_once_opened">Opened</string>
+    <string name="view_once_sent_hint">Disappears after it is opened</string>
+    <string name="view_once_notice">The sender will see that you opened it. It cannot be opened again.</string>
+    <string name="attach_view_once">View-once photo</string>
+    <string name="attach_update_needed">View-once photo (update needed)</string>
+    <string name="timer_button">Message timer</string>
+    <string name="timer_10s">10 seconds</string>
+    <string name="timer_1m">1 minute</string>
+    <string name="timer_1h">1 hour</string>
+    <string name="timer_1d">1 day</string>
+    <string name="timer_update_needed">Message timer (update needed)</string>
+    <string name="timer_ring">Disappears soon</string>
+    <string name="private_mode">Private mode</string>
+    <string name="private_banner">Private mode · nothing is saved</string>
+    <string name="private_toggle_on">Turn on private mode</string>
+    <string name="private_toggle_off">Turn off private mode</string>
+    <string name="private_update_needed">Private mode needs an updated app on the other phone.</string>
+    <string name="private_hint">Messages stay in memory only. They are wiped when either of you leaves the chat, switches apps, locks the screen or after 5 minutes without activity.</string>
+    <string name="private_chat_empty">Nothing is saved in this chat.</string>
+    <string name="time_now">now</string>
+    <string name="phrase_card_title">Save your recovery phrase</string>
+    <string name="phrase_card_body">It is the only way to get your chats back on a new phone. It takes a minute.</string>
+    <string name="phrase_card_action">Save it now</string>
+    <string name="done">Done</string>
+
+    <string name="clip_invite_title">Connect with the person who invited you?</string>
+    <string name="clip_invite_body">You opened Swell from an invite link. Connecting lets them message you.</string>
+    <string name="not_now">Not now</string>
+    <string name="tick_sent">Sent</string>
+    <string name="tick_delivered">Delivered</string>
+    <string name="tick_read">Read</string>
+    <string name="photo_plain">Photo</string>
+    <string name="file_plain">File</string>
 </resources>

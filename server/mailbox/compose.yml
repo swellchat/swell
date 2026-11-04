@@ -6,9 +6,10 @@ services:
     restart: unless-stopped
     volumes:
       - ./data:/data
-    cpus: 0.5
-    mem_limit: 256m
-    pids_limit: 128
+    # No CPU or memory cap (owner, 2026-11-04): the mailbox may use what the VPS has.
+    pids_limit: 1024 # virtual threads: only a few carrier threads, however many waiters
+    ulimits:
+      nofile: { soft: 16384, hard: 16384 } # one socket per parked WAIT (default caps: 6000 connections, 4000 waiters)
     read_only: true
     tmpfs:
       - /tmp

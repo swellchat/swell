@@ -62,6 +62,9 @@ import com.jijilabsdigital.swell.data.Db
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import androidx.compose.material.icons.filled.Block
+import androidx.compose.material.icons.filled.Lock
+import androidx.compose.material.icons.filled.LockOpen
+import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Timer
 import androidx.compose.material.icons.filled.Verified
@@ -87,7 +90,9 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.material3.LocalContentColor
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -129,10 +134,11 @@ private fun NoteAvatar() {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun ChatsScreen(onOpen: (String, String?) -> Unit, onAdd: () -> Unit, onSettings: () -> Unit) {
+fun ChatsScreen(onOpen: (String, String?) -> Unit, onAdd: () -> Unit, onSettings: () -> Unit, onPhrase: () -> Unit = {}) {
     val changes by Swell.changes.collectAsStateWithLifecycle()
     val net by Swell.net.collectAsStateWithLifecycle()
     var searching by remember { mutableStateOf(false) }
+    var phraseCardShown by remember { mutableStateOf(true) }
     var query by remember { mutableStateOf("") }
     val data by produceState(Pair(emptyList<Contact>(), emptyMap<String, StoredMessage>()), changes, net) {
         value = withContext(Dispatchers.IO) { Swell.contacts() to Swell.db.lastMessages() }
@@ -142,6 +148,11 @@ fun ChatsScreen(onOpen: (String, String?) -> Unit, onAdd: () -> Unit, onSettings
     }
     val (contacts, last) = data
     val noteLabel = stringResource(R.string.note_to_self)
+    // First open after install: an invite link on the clipboard (from the web page's "Get Swell") is offered in one tap.
+    val ctx0 = androidx.compose.ui.platform.LocalContext.current
+    ClipInvitePrompt(firstOpenOnly = true) { code ->
+        Swell.accept(code, onDone = { c -> onOpen(c.id, null) }, onError = { Swell.toast(it) })
+    }
     Scaffold(
         topBar = {
             TopAppBar(
@@ -170,7 +181,7 @@ fun ChatsScreen(onOpen: (String, String?) -> Unit, onAdd: () -> Unit, onSettings
         },
         floatingActionButton = {
             if (!searching) ExtendedFloatingActionButton(
-                onClick = onAdd, containerColor = Ocean.Cyan, contentColor = Ocean.Deep,
+                onClick = onAdd, containerColor = Ocean.Cyan, contentColor = Ocean.OnAccent,
                 icon = { Icon(Icons.Default.Add, null) },
                 text = { Text(stringResource(R.string.add_contact), fontWeight = FontWeight.Bold) },
             )
@@ -193,7 +204,7 @@ fun ChatsScreen(onOpen: (String, String?) -> Unit, onAdd: () -> Unit, onSettings
                         val sub = subtitle ?: m?.let { previewText(it) }
                         if (sub != null) Text(sub, maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
-                    m?.let { Text(DateUtils.getRelativeTimeSpanString(it.at).toString(), style = MaterialTheme.typography.labelSmall) }
+                    m?.let { Text(if (System.currentTimeMillis() - it.at < 60_000) stringResource(R.string.time_now) else DateUtils.getRelativeTimeSpanString(it.at).toString(), style = MaterialTheme.typography.labelSmall) }
                 }
                 HorizontalDivider(Modifier.padding(start = 72.dp))
             }
@@ -226,6 +237,9 @@ fun ChatsScreen(onOpen: (String, String?) -> Unit, onAdd: () -> Unit, onSettings
                     item(key = "self") {
                         Row1(noteLabel, { NoteAvatar() }, last[Swell.SELF], false, false, if (last[Swell.SELF] == null) stringResource(R.string.note_to_self_empty) else null) { onOpen(Swell.SELF, null) }
                     }
+                    if (phraseCardShown && Swell.phraseCardDue(contacts.isNotEmpty())) item(key = "phrase-card") {
+                        PhraseCard(onPhrase) { phraseCardShown = false }
+                    }
                     if (contacts.isEmpty()) item {
                         Column(Modifier.fillMaxWidth().padding(32.dp), horizontalAlignment = Alignment.CenterHorizontally) {
                             BrandMark(112.dp)
@@ -249,6 +263,22 @@ fun ChatsScreen(onOpen: (String, String?) -> Unit, onAdd: () -> Unit, onSettings
     }
 }
 
+/** A gentle reminder to write the recovery phrase down: after the first chat or after a day. "Later" hides it until the app is opened again. */
+@Composable
+private fun PhraseCard(onSave: () -> Unit, onLater: () -> Unit) {
+    Column(
+        Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp).clip(RoundedCornerShape(16.dp)).background(MaterialTheme.colorScheme.surfaceVariant).padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        Text(stringResource(R.string.phrase_card_title), style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+        Text(stringResource(R.string.phrase_card_body), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            androidx.compose.material3.Button(onSave, Modifier.height(48.dp)) { Text(stringResource(R.string.phrase_card_action)) }
+            androidx.compose.material3.TextButton(onLater, Modifier.height(48.dp)) { Text(stringResource(R.string.later)) }
+        }
+    }
+}
+
 @Composable
 private fun SectionLabel(text: String) {
     Text(text, Modifier.padding(horizontal = 16.dp, vertical = 8.dp), style = MaterialTheme.typography.labelLarge, color = Ocean.Cyan)
@@ -262,8 +292,15 @@ fun ChatScreen(contactId: String, onBack: () -> Unit, onInfo: () -> Unit, jumpTo
     val changes by Swell.changes.collectAsStateWithLifecycle()
     val contact = remember(changes) { if (isSelf) null else Swell.contact(contactId) }
     val data by produceState(Pair(emptyList<StoredMessage>(), emptyMap<String, List<Reaction>>()), changes) {
-        value = withContext(Dispatchers.IO) { Swell.db.messages(contactId).let { ms -> ms to Swell.db.reactions(ms.map { it.id }) } }
+        value = withContext(Dispatchers.IO) {
+            // Private messages come from memory and are mixed in by time; they are never in the database.
+            Swell.db.messages(contactId).let { ms -> (ms + Swell.privateMessages(contactId)).sortedBy { it.at }.let { all -> all to Swell.db.reactions(ms.map { it.id }) } }
+        }
     }
+    val privateIds by Swell.privateOn.collectAsStateWithLifecycle()
+    val privateOn = !isSelf && contactId in privateIds
+    var timerSec by remember { mutableStateOf(0) }
+    var photoOnce by remember { mutableStateOf(false) }
     val (messages, reactions) = data
     val byId = remember(messages) { messages.associateBy { it.id } }
     var text by remember { mutableStateOf("") }
@@ -298,8 +335,13 @@ fun ChatScreen(contactId: String, onBack: () -> Unit, onInfo: () -> Unit, jumpTo
     }
     DisposableEffect(contactId) {
         Swell.openChat = contactId
-        onDispose { Swell.openChat = null }
+        onDispose {
+            Swell.openChat = null
+            // Leaving the chat wipes its private messages here and on the other phone (not on a rotation).
+            if ((context as? android.app.Activity)?.isChangingConfigurations != true) Swell.wipePrivate(contactId)
+        }
     }
+    SecureWhile(privateOn)
     // Incoming messages shown here count as read (and, if receipts are on, the sender is told).
     LaunchedEffect(contactId, changes) { Swell.markRead(contactId) }
     // Keep the Tor stream to this contact open while the chat is on screen.
@@ -320,14 +362,17 @@ fun ChatScreen(contactId: String, onBack: () -> Unit, onInfo: () -> Unit, jumpTo
     val isTyping = Swell.typingIndicators && tick >= 0 && (typingMap[contactId] ?: 0L) > System.currentTimeMillis()
 
     val pickPhoto = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
-        if (uri != null) { val r = replyTo?.id; Swell.work {
-            runCatching { Swell.readPhoto(uri) }.onSuccess { Swell.sendFile(contactId, "photo-${System.currentTimeMillis()}.jpg", "image/jpeg", it, text.trim(), r); text = "" }
+        Swell.pickerOpen = false
+        if (uri != null) { val r = replyTo?.id; val once = photoOnce; val tm = timerSec; Swell.work {
+            runCatching { Swell.readPhoto(uri) }.onSuccess { Swell.sendFile(contactId, "photo-${System.currentTimeMillis()}.jpg", "image/jpeg", it, if (once) "" else text.trim(), r, viewOnce = once, timerSec = tm); text = "" }
                 .onFailure { Swell.toast(it.message ?: "") }
         }; replyTo = null }
+        photoOnce = false
     }
     val pickFile = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
-        if (uri != null) { val r = replyTo?.id; Swell.work {
-            runCatching { Swell.readFile(uri) }.onSuccess { (n, mime, b) -> Swell.sendFile(contactId, n, mime, b, text.trim(), r); text = "" }
+        Swell.pickerOpen = false
+        if (uri != null) { val r = replyTo?.id; val tm = timerSec; Swell.work {
+            runCatching { Swell.readFile(uri) }.onSuccess { (n, mime, b) -> Swell.sendFile(contactId, n, mime, b, text.trim(), r, timerSec = tm); text = "" }
                 .onFailure { Swell.toast(it.message ?: "") }
         }; replyTo = null }
     }
@@ -357,19 +402,24 @@ fun ChatScreen(contactId: String, onBack: () -> Unit, onInfo: () -> Unit, jumpTo
 
     var attachMenu by remember { mutableStateOf(false) }
     var viewing by remember { mutableStateOf<StoredMessage?>(null) }
+    var viewingOnce by remember { mutableStateOf<StoredMessage?>(null) }
+    // A wipe closes whatever private photo is open.
+    LaunchedEffect(messages) { viewing?.let { v -> if (v.isPrivate && messages.none { it.id == v.id }) viewing = null } }
 
     fun submit() {
         val t = text.trim()
         if (t.isEmpty()) return
         val e = editing
-        if (e != null) { Swell.editMessage(e, t); editing = null } else { Swell.send(contactId, t, replyTo?.id); replyTo = null }
+        if (e != null) { Swell.editMessage(e, t); editing = null } else { Swell.send(contactId, t, replyTo?.id, timerSec); replyTo = null }
         text = ""
     }
     fun senderLabel(m: StoredMessage) = if (m.incoming) (contact?.let { it.name.ifBlank { context.getString(R.string.new_contact) } } ?: "") else context.getString(R.string.you)
 
     Scaffold(
+        containerColor = if (privateOn) PrivateLook.Background else MaterialTheme.colorScheme.background,
         topBar = {
             TopAppBar(
+                colors = if (privateOn) androidx.compose.material3.TopAppBarDefaults.topAppBarColors(containerColor = PrivateLook.Bar) else androidx.compose.material3.TopAppBarDefaults.topAppBarColors(),
                 navigationIcon = { IconButton(onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, stringResource(R.string.back)) } },
                 title = {
                     if (searching) {
@@ -409,14 +459,25 @@ fun ChatScreen(contactId: String, onBack: () -> Unit, onInfo: () -> Unit, jumpTo
                         }
                         IconButton({ searching = false; query = "" }) { Icon(Icons.Default.Close, stringResource(R.string.search_close)) }
                     } else {
+                        if (contact != null && contact.blocked.not()) IconButton({
+                            if (!privateOn && !contact.supportsPrivate) Swell.toast(context.getString(R.string.private_update_needed))
+                            else Swell.setPrivate(contactId, !privateOn)
+                        }) {
+                            Icon(
+                                if (privateOn) Icons.Default.Lock else Icons.Default.LockOpen,
+                                stringResource(if (privateOn) R.string.private_toggle_off else R.string.private_toggle_on),
+                                tint = if (privateOn) PrivateLook.Accent else if (contact.supportsPrivate) LocalContentColor.current else LocalContentColor.current.copy(alpha = 0.38f),
+                            )
+                        }
                         IconButton({ searching = true }) { Icon(Icons.Default.Search, stringResource(R.string.search_in_chat)) }
                     }
                 },
             )
         },
     ) { pad ->
-        Column(Modifier.padding(pad).fillMaxSize().imePadding()) {
-            if (contact != null && !contact.verified) {
+        Column(Modifier.padding(pad).fillMaxSize().imePadding().then(if (privateOn) Modifier.background(PrivateLook.Background) else Modifier)) {
+            if (privateOn) PrivateBanner()
+            if (contact != null && !contact.verified && !privateOn) {
                 Text(
                     stringResource(R.string.unverified_banner),
                     Modifier.fillMaxWidth().clickable(onClick = onInfo).background(Ocean.Raised).padding(horizontal = 16.dp, vertical = 8.dp),
@@ -432,12 +493,18 @@ fun ChatScreen(contactId: String, onBack: () -> Unit, onInfo: () -> Unit, jumpTo
             }
             LazyColumn(Modifier.weight(1f).fillMaxWidth().padding(horizontal = 12.dp), state = list, verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 item { Spacer(Modifier.size(8.dp)) }
+                if (privateOn && messages.isEmpty()) item {
+                    Text(stringResource(R.string.private_hint), Modifier.fillMaxWidth().padding(24.dp), color = PrivateLook.Accent.copy(alpha = 0.8f),
+                        style = MaterialTheme.typography.bodyMedium, textAlign = androidx.compose.ui.text.style.TextAlign.Center)
+                }
                 items(messages, key = { it.id }) { m ->
+                    // A per-message timer starts the moment the message is on screen.
+                    if (m.incoming && m.timerSec > 0 && m.vanishAt == 0L) LaunchedEffect(m.id) { Swell.shown(m) }
                     Bubble(
                         m, byId[m.replyTo], reactions[m.id].orEmpty(), highlighted = flash == m.id || (searching && m.id in matches),
                         label = m.replyTo?.let { byId[it] }?.let(::senderLabel).orEmpty(),
-                        onOpen = { viewing = it }, onLongPress = { if (!m.deleted && !m.id.startsWith("p")) menuFor = m },
-                        onReply = { if (!m.deleted && !m.id.startsWith("p") && contact?.blocked != true) { replyTo = m; editing = null } },
+                        onOpen = { viewing = it }, onOpenOnce = { viewingOnce = it }, onLongPress = { if (!m.deleted && !m.id.startsWith("p")) menuFor = m },
+                        onReply = { if (!m.deleted && !m.id.startsWith("p") && contact?.blocked != true && !m.viewOnce && !m.isPrivate) { replyTo = m; editing = null } },
                         onQuote = { jump(it) },
                     )
                 }
@@ -465,16 +532,27 @@ fun ChatScreen(contactId: String, onBack: () -> Unit, onInfo: () -> Unit, jumpTo
                             DropdownMenu(attachMenu, { attachMenu = false }) {
                                 DropdownMenuItem(
                                     text = { Text(stringResource(R.string.attach_photo)) }, leadingIcon = { Icon(Icons.Default.Image, null) },
-                                    onClick = { attachMenu = false; pickPhoto.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)) },
+                                    onClick = { attachMenu = false; photoOnce = false; Swell.pickerOpen = true; pickPhoto.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)) },
                                 )
-                                DropdownMenuItem(
+                                if (!privateOn && !isSelf) {
+                                    val onceOk = contact?.supportsViewOnce == true
+                                    DropdownMenuItem(
+                                        text = { Text(stringResource(if (onceOk) R.string.attach_view_once else R.string.attach_update_needed)) },
+                                        leadingIcon = { Icon(Icons.Default.Visibility, null) }, enabled = onceOk,
+                                        onClick = { attachMenu = false; photoOnce = true; Swell.pickerOpen = true; pickPhoto.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)) },
+                                    )
+                                }
+                                if (!privateOn) DropdownMenuItem(
                                     text = { Text(stringResource(R.string.attach_file)) }, leadingIcon = { Icon(Icons.Default.Description, null) },
-                                    onClick = { attachMenu = false; pickFile.launch(arrayOf("*/*")) },
+                                    onClick = { attachMenu = false; Swell.pickerOpen = true; pickFile.launch(arrayOf("*/*")) },
                                 )
                             }
                         }
-                        OutlinedTextField(text, { text = it }, Modifier.weight(1f), placeholder = { Text(stringResource(R.string.message_hint)) }, maxLines = 5, shape = RoundedCornerShape(24.dp))
-                        if (text.isBlank() && editing == null) {
+                        OutlinedTextField(text, { text = it; if (privateOn) Swell.touchPrivate(contactId) }, Modifier.weight(1f), placeholder = { Text(stringResource(R.string.message_hint)) }, maxLines = 5, shape = RoundedCornerShape(24.dp))
+                        if (!isSelf && !privateOn && editing == null) TimerButton(timerSec, contact?.supportsViewOnce == true) { timerSec = it }
+                        // Voice notes need a temporary file to play, so they are not offered in private mode.
+                        if (text.isBlank() && editing == null && privateOn) Unit
+                        else if (text.isBlank() && editing == null) {
                             IconButton({
                                 if (androidx.core.content.ContextCompat.checkSelfPermission(context, android.Manifest.permission.RECORD_AUDIO) == android.content.pm.PackageManager.PERMISSION_GRANTED) startRecording()
                                 else askMic.launch(android.Manifest.permission.RECORD_AUDIO)
@@ -491,12 +569,13 @@ fun ChatScreen(contactId: String, onBack: () -> Unit, onInfo: () -> Unit, jumpTo
     }
 
     viewing?.let { PhotoViewer(it) { viewing = null } }
+    viewingOnce?.let { ViewOnceViewer(it) { viewingOnce = null } }
 
     menuFor?.let { m ->
         androidx.compose.material3.ModalBottomSheet({ menuFor = null }) {
             val mine = reactions[m.id]?.firstOrNull { it.who == Db.ME }?.emoji
             Column(Modifier.padding(bottom = 24.dp)) {
-                Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp), horizontalArrangement = Arrangement.SpaceEvenly) {
+                if (!m.viewOnce && !m.isPrivate) Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp), horizontalArrangement = Arrangement.SpaceEvenly) {
                     QUICK_REACTIONS.forEach { e ->
                         Box(
                             Modifier.size(48.dp).clip(CircleShape).background(if (e == mine) Ocean.Electric.copy(alpha = 0.4f) else Color.Transparent)
@@ -514,8 +593,8 @@ fun ChatScreen(contactId: String, onBack: () -> Unit, onInfo: () -> Unit, jumpTo
                         Text(label, style = MaterialTheme.typography.bodyLarge, color = if (danger) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface)
                     }
                 }
-                if (contact?.blocked != true) Item(stringResource(R.string.reply), Icons.AutoMirrored.Filled.Reply) { replyTo = m; editing = null }
-                if (m.text.isNotBlank()) Item(stringResource(R.string.copy), Icons.Default.ContentCopy) {
+                if (contact?.blocked != true && !m.viewOnce && !m.isPrivate) Item(stringResource(R.string.reply), Icons.AutoMirrored.Filled.Reply) { replyTo = m; editing = null }
+                if (m.text.isNotBlank() && !m.isPrivate) Item(stringResource(R.string.copy), Icons.Default.ContentCopy) {
                     clipboard.setText(androidx.compose.ui.text.AnnotatedString(m.text)); Swell.toast(context.getString(R.string.copied))
                 }
                 if (Swell.canEdit(m)) Item(stringResource(R.string.edit), Icons.Default.Edit) { editing = m; replyTo = null; text = m.text }
@@ -548,8 +627,13 @@ private fun decode(bytes: ByteArray, maxPx: Int): androidx.compose.ui.graphics.I
 @Composable
 private fun Thumb(m: StoredMessage, maxPx: Int, modifier: Modifier) {
     val id = m.fileId ?: return
-    val img by produceState(thumbs.get("$id@$maxPx"), id) {
-        if (value == null) value = withContext(Dispatchers.IO) { Files.load(id)?.let { decode(it, maxPx) }?.also { thumbs.put("$id@$maxPx", it) } }
+    // Private photos come from memory and are never put in the thumbnail cache.
+    val priv = m.isPrivate
+    val img by produceState(if (priv) null else thumbs.get("$id@$maxPx"), id) {
+        if (value == null) value = withContext(Dispatchers.IO) {
+            if (priv) Swell.privateStore.file(id)?.let { decode(it, maxPx) }
+            else Files.load(id)?.let { decode(it, maxPx) }?.also { thumbs.put("$id@$maxPx", it) }
+        }
     }
     img?.let { Image(it, null, modifier, contentScale = ContentScale.Fit) }
         ?: Box(modifier.size(200.dp, 150.dp).background(Ocean.Deep), contentAlignment = Alignment.Center) { Icon(Icons.Default.Image, null) }
@@ -574,10 +658,11 @@ private fun rememberSaver(m: StoredMessage): () -> Unit {
 private fun PhotoViewer(m: StoredMessage, onClose: () -> Unit) {
     val save = rememberSaver(m)
     androidx.compose.ui.window.Dialog(onClose, androidx.compose.ui.window.DialogProperties(usePlatformDefaultWidth = false)) {
+        if (m.isPrivate) SecureDialogWindow()
         Box(Modifier.fillMaxSize().background(Color.Black)) {
             Thumb(m, 2048, Modifier.fillMaxSize())
             Row(Modifier.align(Alignment.TopEnd).padding(8.dp)) {
-                IconButton(save) { Icon(Icons.Default.Download, stringResource(R.string.save), tint = Color.White) }
+                if (!m.isPrivate) IconButton(save) { Icon(Icons.Default.Download, stringResource(R.string.save), tint = Color.White) }
                 IconButton(onClose) { Icon(Icons.Default.Close, stringResource(R.string.close), tint = Color.White) }
             }
         }
@@ -594,7 +679,7 @@ private fun size(n: Long) = when {
 @Composable
 private fun Bubble(
     m: StoredMessage, quoted: StoredMessage?, reactions: List<Reaction>, highlighted: Boolean, label: String,
-    onOpen: (StoredMessage) -> Unit, onLongPress: () -> Unit, onReply: () -> Unit, onQuote: (String) -> Unit,
+    onOpen: (StoredMessage) -> Unit, onOpenOnce: (StoredMessage) -> Unit, onLongPress: () -> Unit, onReply: () -> Unit, onQuote: (String) -> Unit,
 ) {
     val context = androidx.compose.ui.platform.LocalContext.current
     val density = androidx.compose.ui.platform.LocalDensity.current
@@ -616,7 +701,7 @@ private fun Bubble(
         ) {
             val shape = if (m.incoming) RoundedCornerShape(4.dp, 18.dp, 18.dp, 18.dp) else RoundedCornerShape(18.dp, 4.dp, 18.dp, 18.dp)
             Surface(
-                color = if (m.incoming) Ocean.Navy else Color.Transparent,
+                color = if (m.incoming) (if (m.isPrivate) PrivateLook.Bubble else Ocean.Navy) else Color.Transparent,
                 contentColor = if (m.incoming) Ocean.Text else Color.White,
                 shape = shape,
                 border = if (highlighted) androidx.compose.foundation.BorderStroke(2.dp, Ocean.Cyan) else null,
@@ -625,13 +710,15 @@ private fun Bubble(
                     onLongClick = onLongPress,
                 ),
             ) {
-                Column(Modifier.then(if (m.incoming) Modifier else Modifier.background(Ocean.Bubble)).padding(horizontal = 14.dp, vertical = 8.dp)) {
+                Column(Modifier.then(if (m.incoming) Modifier else Modifier.background(if (m.isPrivate) Brush.linearGradient(listOf(Color(0xFF4C1D95), Color(0xFF6D28D9))) else Ocean.Bubble)).padding(horizontal = 14.dp, vertical = 8.dp)) {
                     if (m.replyTo != null && !m.deleted) {
                         QuoteBox(quoted, label) { onQuote(m.replyTo) }
                         Spacer(Modifier.size(6.dp))
                     }
                     if (m.deleted) {
                         DeletedText()
+                    } else if (m.viewOnce) {
+                        ViewOnceTile(m) { onOpenOnce(m) }
                     } else {
                         if (m.fileId != null) {
                             if (m.isImage) {
@@ -664,7 +751,8 @@ private fun Bubble(
                         else -> null
                     }
                     Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically, modifier = Modifier.align(Alignment.End)) {
-                        if (m.expireSec > 0) Icon(Icons.Default.Timer, null, Modifier.size(12.dp))
+                        if (m.timerSec > 0 || (m.viewOnce && m.vanishAt > 0)) TimerRing(m)
+                        else if (m.expireSec > 0) Icon(Icons.Default.Timer, null, Modifier.size(12.dp))
                         if (m.status == StoredMessage.SENDING) Icon(Icons.Default.Schedule, stringResource(R.string.status_sending), Modifier.size(13.dp))
                         if (m.edited && !m.deleted) Text(stringResource(R.string.edited), style = MaterialTheme.typography.labelSmall, fontStyle = androidx.compose.ui.text.font.FontStyle.Italic)
                         Text(
@@ -673,11 +761,11 @@ private fun Bubble(
                             fontWeight = if (m.status == StoredMessage.FAILED) FontWeight.Bold else null,
                         )
                         // Ticks only appear while receipts are on (both ways).
-                        if (!m.incoming && Swell.readReceipts && m.contactId != Swell.SELF) when (m.status) {
-                            StoredMessage.SENT -> Icon(Icons.Default.Check, null, Modifier.size(14.dp), tint = Color.White.copy(alpha = 0.6f))
-                            StoredMessage.DELIVERED -> Icon(Icons.Default.DoneAll, null, Modifier.size(14.dp), tint = Color.White.copy(alpha = 0.6f))
+                        if (!m.incoming && Swell.readReceipts && m.contactId != Swell.SELF && !m.isPrivate) when (m.status) {
+                            StoredMessage.SENT -> Icon(Icons.Default.Check, stringResource(R.string.tick_sent), Modifier.size(14.dp), tint = Color.White.copy(alpha = 0.6f))
+                            StoredMessage.DELIVERED -> Icon(Icons.Default.DoneAll, stringResource(R.string.tick_delivered), Modifier.size(14.dp), tint = Color.White.copy(alpha = 0.6f))
                             // Read = full white (the gradient ends in cyan, so a cyan tick would vanish).
-                            StoredMessage.READ -> Icon(Icons.Default.DoneAll, null, Modifier.size(14.dp), tint = Color.White)
+                            StoredMessage.READ -> Icon(Icons.Default.DoneAll, stringResource(R.string.tick_read), Modifier.size(14.dp), tint = Color.White)
                         }
                     }
                 }

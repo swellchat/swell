@@ -35,19 +35,20 @@ final class HardeningTests: XCTestCase {
         XCTAssertTrue(net.queues[Codec.hex(net.helloInfo!.queue)]!.isEmpty)
     }
 
-    func testAndroidFileBecomesNotice() async throws {
+    func testIncomingPhotoWithoutPartsWaitsAndInvalidFileIsDropped() async throws {
         let net = try FakeNet()
         let e = try engine(net, MemoryKeyValueStore())
+        await e.setFilesDirectory(FileManager.default.temporaryDirectory.appendingPathComponent("swf-\(UUID().uuidString)"))
         let c = try await e.redeem(net.invite(), firstText: "Hi")
         let h = net.helloInfo!
-        let o = Out().u8(8).raw(Codec.random(16)).i64(1_700_000_000_000).i32(0).str("").raw(Codec.random(16)).str("holiday.jpg")
-            .str("image/jpeg").i64(1234).raw(Codec.random(32)).i32(1)
+        // a FILE that claims 10 MB is dropped without a notice; one whose parts never arrive shows nothing yet
+        let o = Out().u8(8).raw(Codec.random(16)).i64(1_700_000_000_000).i32(0).str("").raw(Codec.random(16)).str("big.bin")
+            .str("application/octet-stream").i64(10_000_000).raw(Codec.random(32)).i32(1)
         let enc = try net.inviter.encrypt(channelId: h.channel, plaintext: o.done())
         net.queues[Codec.hex(h.queue)]!.append(("f1", PeerFrame.msg(channelId: h.channel, ciphertextType: enc.type, ciphertext: enc.ciphertext)))
         _ = await e.poll()
-        let m = await e.messages(c.id).filter(\.incoming)
-        XCTAssertEqual(m.count, 1)
-        XCTAssertTrue(m[0].text.hasPrefix("holiday.jpg:") && m[0].text.contains("Android"))
+        let inc = await e.messages(c.id).filter(\.incoming)
+        XCTAssertTrue(inc.isEmpty)
         XCTAssertTrue(net.queues[Codec.hex(h.queue)]!.isEmpty)
     }
 

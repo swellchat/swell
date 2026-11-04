@@ -57,7 +57,9 @@ object Notifications {
     const val ID_CONNECTED = 1
     private const val ID_MESSAGE = 2
     private const val CH_CONNECTED = "connected"
-    private const val CH_MESSAGES = "messages"
+    
+    /** The messages channel id depends on the chosen sound (Android fixes a channel's sound once it exists). */
+    private fun messagesChannel(): String = "messages-" + (Swell.notifSound ?: "default").hashCode().toUInt().toString(16)
 
     fun createChannels(context: Context) {
         val nm = context.getSystemService(NotificationManager::class.java)
@@ -66,9 +68,18 @@ object Notifications {
                 setShowBadge(false)
             },
         )
+        val id = messagesChannel()
+        nm.notificationChannels.filter { it.id.startsWith("messages") && it.id != id }.forEach { nm.deleteNotificationChannel(it.id) }
         nm.createNotificationChannel(
-            NotificationChannel(CH_MESSAGES, context.getString(R.string.channel_messages), NotificationManager.IMPORTANCE_HIGH).apply {
+            NotificationChannel(id, context.getString(R.string.channel_messages), NotificationManager.IMPORTANCE_HIGH).apply {
                 lockscreenVisibility = Notification.VISIBILITY_PRIVATE
+                val snd = Swell.notifSound
+                val attrs = android.media.AudioAttributes.Builder().setUsage(android.media.AudioAttributes.USAGE_NOTIFICATION_COMMUNICATION_INSTANT).build()
+                when {
+                    snd == null -> {}                       // system default
+                    snd.isEmpty() -> setSound(null, null)   // silent
+                    else -> setSound(android.net.Uri.parse(snd), attrs)
+                }
             },
         )
     }
@@ -89,19 +100,42 @@ object Notifications {
             .setVisibility(NotificationCompat.VISIBILITY_SECRET) // not on the lock screen (audit L-09)
             .build()
 
-    /** Never shows the sender or the text: only "New message". */
-    fun newMessage(context: Context) {
+    enum class Kind { PLAIN, VIEW_ONCE, PRIVATE }
+
+    /** Removes the message notification (a view-once photo was opened, a private chat was wiped). */
+    fun cancelMessages(context: Context) { NotificationManagerCompat.from(context).cancel(ID_MESSAGE) }
+
+    /**
+     * What the notification shows follows Settings: nothing ("New message"), the name only, or name and text.
+     * View-once and private messages never show a name or content, whatever the setting says.
+     */
+    fun newMessage(context: Context, kind: Kind = Kind.PLAIN, name: String? = null, text: String? = null) {
         if (Build.VERSION.SDK_INT >= 33 &&
             ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
         ) return
-        val n = NotificationCompat.Builder(context, CH_MESSAGES)
+        val generic = when (kind) { Kind.PLAIN -> R.string.notif_new_message; Kind.VIEW_ONCE -> R.string.notif_view_once; Kind.PRIVATE -> R.string.notif_private }
+        val level = if (kind == Kind.PLAIN) Swell.notifContent else 0
+        val title = if (level >= 1 && !name.isNullOrBlank()) name else context.getString(generic)
+        val body = if (level >= 1 && !name.isNullOrBlank()) (if (level >= 2 && !text.isNullOrBlank()) text.take(120) else context.getString(generic)) else null
+        val n = NotificationCompat.Builder(context, messagesChannel())
             .setSmallIcon(R.drawable.ic_stat_swell)
-            .setContentTitle(context.getString(R.string.notif_new_message))
+            .setContentTitle(title)
+            .apply { if (body != null) setContentText(body) }
             .setContentIntent(openApp(context))
             .setAutoCancel(true)
             .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
             .setCategory(NotificationCompat.CATEGORY_MESSAGE)
             .build()
         NotificationManagerCompat.from(context).notify(ID_MESSAGE, n)
+    }
+
+    /** A short sound for a message that arrives while the app is open. */
+    fun playInApp(context: Context) {
+        val snd = Swell.notifSound
+        if (snd != null && snd.isEmpty()) return
+        runCatching {
+            val uri = snd?.let { android.net.Uri.parse(it) } ?: android.media.RingtoneManager.getDefaultUri(android.media.RingtoneManager.TYPE_NOTIFICATION)
+            android.media.RingtoneManager.getRingtone(context, uri)?.play()
+        }
     }
 }

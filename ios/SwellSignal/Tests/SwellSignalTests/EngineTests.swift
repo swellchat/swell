@@ -16,6 +16,7 @@ final class FakeNet: MailboxTransport, @unchecked Sendable {
     var helloInfo: (channel: [UInt8], mailbox: String, queue: [UInt8], name: String)?
     var bundleServed = false
     var waitSupported = true
+    var maxWaitQueues = 64
     var peekSupported = true
     var waits = 0
     let inviteSecret = Codec.random(32)
@@ -96,6 +97,7 @@ final class FakeNet: MailboxTransport, @unchecked Sendable {
             guard waitSupported else { return [0xFF] }
             waits += 1
             _ = try r.i32(); let n = Int(try r.i32())
+            guard n <= maxWaitQueues else { return [0xFF] }
             let o = Out()
             var items: [(Int, String, [UInt8])] = []
             for i in 0..<n {
@@ -335,6 +337,45 @@ final class EngineTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
     }
 
+    func testPhotoAndFileBothWays() async throws {
+        let net = try FakeNet()
+        let e = try engine(net, MemoryKeyValueStore())
+        await e.setFilesDirectory(dir.appendingPathComponent("files2"))
+        let c = try await e.redeem(net.invite(), firstText: "Hi")
+        let progress = ProgressLog()
+        await e.setOnProgress { id, p in progress.add(id, p) }
+        let jpeg = [UInt8](repeating: 0xAB, count: 130_000)
+        let m = try await e.sendFile(jpeg, name: "photo-1.jpg", mime: "image/jpeg", caption: "look", to: c.id)
+        XCTAssertEqual(m.status, .sentDirect); XCTAssertEqual(m.fileMime, "image/jpeg"); XCTAssertEqual(m.voiceMs, 0)
+        let files = net.inners.filter { $0.first == 8 }
+        XCTAssertEqual(files.count, 1)
+        let fr = In(files[0]); _ = try fr.u8(); _ = try fr.raw(16); _ = try fr.i64(); _ = try fr.i32(); XCTAssertEqual(try fr.str(), "look")
+        _ = try fr.raw(16); XCTAssertEqual(try fr.str(), "photo-1.jpg"); XCTAssertEqual(try fr.str(), "image/jpeg")
+        XCTAssertEqual(try fr.i64(), 130_000); _ = try fr.raw(32); _ = try fr.i32()
+        XCTAssertEqual(try fr.bytes(max: 16), []); XCTAssertEqual(try fr.i32(), 0); XCTAssertEqual(fr.remaining, 0)
+        XCTAssertEqual(progress.last(m.id), 100)
+        let pv = await e.contact(c.id)?.lastText
+        XCTAssertEqual(pv, "look")
+        // oversize is refused
+        do { _ = try await e.sendFile([UInt8](repeating: 1, count: 5_000_001), name: "x", mime: "image/jpeg", to: c.id); XCTFail("should refuse") } catch {}
+        // receive a PDF in two parts
+        let rid = Codec.random(16), fid = Codec.random(16)
+        let doc = (0..<60_000).map { UInt8(truncatingIfNeeded: $0 &* 13) }
+        let chunks = stride(from: 0, to: doc.count, by: 48 * 1024).map { Array(doc[$0..<min($0 + 48 * 1024, doc.count)]) }
+        for (i, ch) in chunks.enumerated() { try putInner(net, Out().u8(7).raw(fid).i32(Int32(i)).bytes(ch).done()) }
+        let hdr = Out().u8(8).raw(rid).i64(1_700_000_000_000).i32(0).str("")
+        hdr.raw(fid).str("../a:b/report.pdf").str("application/pdf").i64(Int64(doc.count)).raw(Codec.sha256(doc)).i32(Int32(chunks.count))
+        try putInner(net, hdr.done())
+        _ = await e.poll()
+        let got = await e.messages(c.id).first { $0.id == Codec.hex(rid) }
+        XCTAssertEqual(got?.fileMime, "application/pdf"); XCTAssertEqual(got?.fileName, "abreport.pdf")
+        XCTAssertFalse(got!.isVoice); XCTAssertEqual(got?.fileSize, 60_000)
+        let url = await e.fileURL(got!.fileId)!
+        XCTAssertEqual([UInt8](try Data(contentsOf: url)), doc)
+        try await e.deleteHere(got!.id, in: c.id)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+    }
+
     func testAvatarRoundTripAndNickname() async throws {
         let net = try FakeNet()
         let e = try engine(net, MemoryKeyValueStore())
@@ -422,6 +463,21 @@ final class EngineTests: XCTestCase {
         XCTAssertTrue(net.queues.values.allSatisfy { $0.isEmpty }, "nothing left on the server")
     }
 
+    func testWaitFallsBackToEightQueuesOnAnOlderMailbox() async throws {
+        let net = try FakeNet(); net.maxWaitQueues = 8
+        let e = try engine(net, MemoryKeyValueStore())
+        await e.setFallbackPoll(0.5)
+        for _ in 0..<9 { _ = try await e.redeem(net.invite(), firstText: "Hi") } // 9 queues: one WAIT of 64 is rejected by this old mailbox
+        let listener = Task { await e.listen() }
+        try await Task.sleep(nanoseconds: 3_000_000_000)
+        listener.cancel()
+        let size = await e.waitGroupSize, ok = await e.waitSupported
+        XCTAssertTrue(ok, "WAIT still works, in groups of 8"); XCTAssertGreaterThan(net.waits, 0)
+        XCTAssertEqual(size, 8)
+        XCTAssertThrowsError(try MailboxProtocol.waitRequest(secrets: []))
+        XCTAssertEqual(try MailboxProtocol.waitRequest(secrets: Array(repeating: Codec.random(32), count: 64)).count, 10 + 64 * 32)
+    }
+
     func testMailboxPutWhenOffline() async throws {
         let net = try FakeNet()
         let e = try engine(net, MemoryKeyValueStore())
@@ -454,4 +510,10 @@ final class EngineTests: XCTestCase {
         let n = await e.contacts().count
         XCTAssertEqual(n, 0)
     }
+}
+
+final class ProgressLog: @unchecked Sendable {
+    private let l = NSLock(); private var d: [String: Int] = [:]
+    func add(_ id: String, _ p: Int) { l.lock(); d[id] = p; l.unlock() }
+    func last(_ id: String) -> Int? { l.lock(); defer { l.unlock() }; return d[id] }
 }

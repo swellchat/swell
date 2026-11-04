@@ -72,6 +72,8 @@ class Contact(
     /** Features the contact announced in HELLO/STATE ([Node.CAP_V11] = replies, reactions, edit/delete, receipts, typing, voice notes). */
     @Volatile var caps: Int = 0,
 ) {
+    /** The contact can show link previews (wire section 5c). */
+    val supportsLinkPreview: Boolean get() = supportsV11 && caps and Node.CAP_LINK_PREVIEW != 0
     val id: String = Codec.hex(channelId)
     @Transient internal var upgraded = false
     val address = SignalProtocolAddress(id, 1)
@@ -79,6 +81,10 @@ class Contact(
 
     /** True if the contact's app understands the 1.1 message types and trailing fields. */
     val supportsV11: Boolean get() = caps and Node.CAP_V11 != 0
+    /** View once and per-message timers (wire section 5b). */
+    val supportsViewOnce: Boolean get() = supportsV11 && caps and Node.CAP_VIEW_ONCE != 0
+    /** Private mode (RAM-only messages, wire section 5b). */
+    val supportsPrivate: Boolean get() = supportsV11 && caps and Node.CAP_PRIVATE_MODE != 0
 
     internal fun encode(): ByteArray = Out().u8(5).raw(channelId).str(onion).bytes(identityKey.serialize()).str(name)
         .u8(if (verified) 1 else 0).u8(if (blocked) 1 else 0).i32(expireSec).i64(createdAt)
@@ -118,7 +124,37 @@ data class Message(
     val replyTo: String? = null,
     /** Length of a voice note in milliseconds, 0 for anything else. */
     val durationMs: Int = 0,
-)
+    /** [Node.FLAG_VIEW_ONCE] / [Node.FLAG_PRIVATE] (wire section 5b). */
+    val flags: Int = 0,
+    /** Per-message timer in seconds, 0 = none (wire section 5b). */
+    val timerSec: Int = 0,
+    /** Link preview built by the sender (wire section 5c). */
+    val preview: LinkPreview? = null,
+) {
+    val viewOnce: Boolean get() = flags and Node.FLAG_VIEW_ONCE != 0
+    val isPrivate: Boolean get() = flags and Node.FLAG_PRIVATE != 0
+}
+
+/** Preview card for a link in a text message: made by the sender, never fetched by the receiver. */
+class LinkPreview(val url: String, val title: String, val site: String, val thumb: ByteArray) {
+    fun encode(): ByteArray = Out().u8(1).str(url).str(title).str(site).bytes(thumb).done()
+
+    companion object {
+        const val MAX_URL = 2048
+        const val MAX_TITLE = 200
+        const val MAX_SITE = 100
+        const val MAX_THUMB = 24 * 1024
+
+        /** Null if the bytes are malformed or over a limit, or the url is not https. */
+        fun decode(b: ByteArray): LinkPreview? = runCatching {
+            val r = In(b)
+            if (r.u8() != 1) return null
+            val url = r.str(MAX_URL); val title = r.str(MAX_TITLE); val site = r.str(MAX_SITE); val thumb = r.bytes(MAX_THUMB)
+            if (!url.startsWith("https://") || url.any { Character.isISOControl(it) }) return null
+            LinkPreview(url, Node.cleanName(title).take(200), Node.cleanName(site).take(100), thumb)
+        }.getOrNull()
+    }
+}
 
 /** A photo or file sent with a message. [data] is filled when it arrives or is sent, then stored by the app. */
 class Attachment(val id: String, val name: String, val mime: String, val size: Long, val data: ByteArray? = null)
@@ -142,6 +178,8 @@ interface NodeEvents {
     fun onTyping(contact: Contact, typing: Boolean) {}
     /** The contact set (JPEG bytes) or removed (null) their profile photo. Already checked: size, hash. Runs in the receive transaction. */
     fun onAvatar(contact: Contact, jpeg: ByteArray?) {}
+    /** The contact switched private mode on ([Node.CONTROL_ON]), off (the app wipes the chat's private messages) or asked for a wipe. */
+    fun onControl(contact: Contact, op: Int) {}
 }
 
 /** Edit and delete-for-everyone rules (wire type MODIFY). */
@@ -164,6 +202,8 @@ object Modify {
 object Receipt {
     const val DELIVERED = 1
     const val READ = 2
+    /** A view-once message was opened. Sent and honoured even with receipts off (wire section 5b). */
+    const val OPENED = 3
 }
 
 /** Call setup inside the encrypted channel (CALLS.md §3.1). [sdp] is empty for hangup and busy. */
@@ -214,6 +254,8 @@ class Node(
     @Volatile var profileName: String = ""
     /** Onion address of the mailbox that holds our messages while we are offline ("" = none). */
     @Volatile var mailboxOnion: String = ""
+    /** Queues per WAIT: 64 against a current mailbox, 8 once an older one refused more. */
+    @Volatile private var waitQueues = MailboxProtocol.MAX_SECRETS_PER_WAIT
 
     val store = KvSignalStore(kv, account)
     private val lock = Any()
@@ -223,6 +265,10 @@ class Node(
     private val signedPreKey: SignedPreKeyRecord
     private val contacts = ConcurrentHashMap<String, Contact>()
     private val inboundCount = ConcurrentHashMap<String, LongArray>() // id -> [minute, count]
+    /** Chats in private mode. RAM only: a restart leaves every chat out of the mode. */
+    private val privateChats: MutableSet<String> = ConcurrentHashMap.newKeySet()
+    /** File parts and file messages of private chats; never touches [kv]. */
+    private val ramKv = MemoryKv()
     private val background = Executors.newSingleThreadScheduledExecutor { r -> Thread(r, "swell-node").apply { isDaemon = true } }
 
     private class OnionEntry(val onion: String, val key: String, val created: Long, var retireAt: Long)
@@ -279,6 +325,11 @@ class Node(
             publishLocked(force = true)
         }
         onion = onions.last().onion
+        // An app update that brings new features tells every contact (their apps learn the new caps from STATE).
+        if (kv.get(NS_ACCT, "caps")?.let { In(it).i32() } != CAPS) {
+            contacts.values.forEach { it.upgraded = true }
+            kv.put(NS_ACCT, "caps", Out().i32(CAPS).done())
+        }
         val upgraded = contacts.values.filter { it.upgraded }
         upgraded.forEach { it.upgraded = false; save(it) }
         upgraded.forEach { c -> background.execute { runCatching { sendState(c) } } }
@@ -646,10 +697,41 @@ class Node(
 
     private fun replyBytes(id: String?): ByteArray = id?.takeIf { it.length == 32 }?.let { Codec.unhex(it) } ?: ByteArray(0)
 
-    fun sendText(c: Contact, text: String, replyTo: String? = null): Message {
-        val m = newMessage(c, text).copy(replyTo = replyTo?.takeIf { it.length == 32 })
-        // Old clients stop reading after the text, so the trailing reply id is safe for them.
-        send(c, Out().u8(I_TEXT).also { writeMsg(it, m); if (m.replyTo != null) it.bytes(replyBytes(m.replyTo)) }.done())
+    /** Optional trailing flags and timer after a TEXT/FILE message (wire section 5b); normalised. */
+    /** Optional preview after the timer of a TEXT message; ignored if malformed or if its link is not in the text. */
+    private fun readPreview(r: In, text: String): LinkPreview? = runCatching {
+        if (!r.more()) null else LinkPreview.decode(r.bytes(LinkPreview.MAX_URL + 1000 + LinkPreview.MAX_THUMB))?.takeIf { text.contains(it.url) }
+    }.getOrNull()
+
+    private fun readExt(r: In, textOnly: Boolean): Pair<Int, Int> = runCatching {
+        if (!r.more()) return@runCatching 0 to 0
+        var fl = r.u8() and (FLAG_VIEW_ONCE or FLAG_PRIVATE)
+        if (textOnly) fl = fl and FLAG_VIEW_ONCE.inv() // view once exists for photos and videos only
+        val t = if (r.more()) r.i32() else 0
+        fl to (if (t in 1..MAX_TIMER_SEC) t else 0)
+    }.getOrDefault(0 to 0)
+
+    /** A feature the contact did not announce is refused here, so the app can say "Update needed". */
+    private fun checkFeatures(c: Contact, flags: Int, timerSec: Int) {
+        if (timerSec !in 0..MAX_TIMER_SEC) throw IllegalArgumentException("timer")
+        if ((flags and FLAG_VIEW_ONCE != 0 || timerSec > 0) && !c.supportsViewOnce) throw IOException("Update needed")
+        if (flags and FLAG_PRIVATE != 0 && !c.supportsPrivate) throw IOException("Update needed")
+    }
+
+    fun sendText(c: Contact, text: String, replyTo: String? = null, flags: Int = 0, timerSec: Int = 0, preview: LinkPreview? = null): Message {
+        val fl = flags and FLAG_PRIVATE // view once is for photos and videos
+        checkFeatures(c, fl, timerSec)
+        // A preview goes only to contacts that announced it, never in private mode, and only if its link is in the text.
+        val pv = preview?.takeIf { c.supportsLinkPreview && fl and FLAG_PRIVATE == 0 && text.contains(it.url) && it.thumb.size <= LinkPreview.MAX_THUMB }
+        val m = newMessage(c, text).copy(replyTo = replyTo?.takeIf { it.length == 32 }, flags = fl, timerSec = timerSec, preview = pv)
+        // Old clients stop reading after the text, so the trailing fields are safe for them.
+        val ext = fl != 0 || timerSec > 0 || pv != null
+        send(c, Out().u8(I_TEXT).also {
+            writeMsg(it, m)
+            if (m.replyTo != null || ext) it.bytes(replyBytes(m.replyTo))
+            if (ext) it.u8(fl).i32(timerSec)
+            if (pv != null) it.bytes(pv.encode())
+        }.done(), useMailbox = fl and FLAG_PRIVATE == 0, directAttempts = if (fl and FLAG_PRIVATE != 0) 2 else 6)
         events.onMessage(c, m)
         return m
     }
@@ -659,8 +741,13 @@ class Node(
      * that names it (name, type, size, SHA-256). Files above [MAX_OFFLINE_FILE] need the contact online.
      */
     fun sendFile(c: Contact, name: String, mime: String, data: ByteArray, caption: String,
-                 replyTo: String? = null, durationMs: Int = 0, progress: (Int) -> Unit = {}): Message {
+                 replyTo: String? = null, durationMs: Int = 0, flags: Int = 0, timerSec: Int = 0, progress: (Int) -> Unit = {}): Message {
         if (data.isEmpty() || data.size > MAX_FILE) throw IOException("Files can be up to ${MAX_FILE / 1_000_000} MB.")
+        val priv = flags and FLAG_PRIVATE != 0
+        val fl = if (flags and FLAG_VIEW_ONCE != 0 && !(mime.startsWith("image/") || mime.startsWith("video/"))) flags and FLAG_VIEW_ONCE.inv() else flags
+        checkFeatures(c, fl, timerSec)
+        // The contact may have restarted and lost the mode: say it again, so parts go to its RAM, not its disk.
+        if (priv) send(c, Out().u8(I_CONTROL).u8(CONTROL_ON).done(), useMailbox = false, directAttempts = 2)
         val fileId = Codec.random(16)
         // The first part is small (it fits a mailbox). If it went directly, the rest go in big parts:
         // each part costs one Tor round trip, so fewer parts is much faster.
@@ -670,7 +757,7 @@ class Node(
         while (off < data.size) {
             val size = if (i == 0 || !direct) PART_SIZE else BIG_PART_SIZE
             val chunk = data.copyOfRange(off, minOf(data.size, off + size))
-            val wasDirect = send(c, Out().u8(I_FILE_PART).raw(fileId).i32(i).bytes(chunk).done(), useMailbox = size == PART_SIZE)
+            val wasDirect = send(c, Out().u8(I_FILE_PART).raw(fileId).i32(i).bytes(chunk).done(), useMailbox = size == PART_SIZE && !priv, directAttempts = if (priv) 2 else 6)
             if (i == 0) direct = wasDirect
             if (!direct && data.size > MAX_OFFLINE_FILE) {
                 throw IOException("The contact is offline. Files over ${MAX_OFFLINE_FILE / 1_000_000.0} MB can only be sent while they are online.")
@@ -680,11 +767,15 @@ class Node(
         }
         val parts = i
         val m = newMessage(c, caption).copy(file = Attachment(Codec.hex(fileId), cleanFileName(name), mime.take(100), data.size.toLong(), data),
-            replyTo = replyTo?.takeIf { it.length == 32 }, durationMs = durationMs.coerceIn(0, MAX_VOICE_MS))
+            replyTo = replyTo?.takeIf { it.length == 32 }, durationMs = durationMs.coerceIn(0, MAX_VOICE_MS), flags = fl, timerSec = timerSec)
         // Version 1.0 rejects a FILE with trailing bytes, so the extras go only to contacts that announced CAP_V11.
-        val extras = c.supportsV11 && (m.replyTo != null || m.durationMs > 0)
+        val ext = fl != 0 || timerSec > 0
+        val extras = c.supportsV11 && (m.replyTo != null || m.durationMs > 0 || ext)
         send(c, Out().u8(I_FILE).also { writeMsg(it, m) }.raw(fileId).str(m.file!!.name).str(m.file.mime).i64(m.file.size)
-            .raw(sha256(data)).i32(parts).also { if (extras) it.bytes(replyBytes(m.replyTo)).i32(m.durationMs) }.done())
+            .raw(sha256(data)).i32(parts).also {
+                if (extras) it.bytes(replyBytes(m.replyTo)).i32(m.durationMs)
+                if (ext) it.u8(fl).i32(timerSec)
+            }.done(), useMailbox = !priv, directAttempts = if (priv) 2 else 6)
         progress(100)
         events.onMessage(c, m)
         return m
@@ -696,9 +787,10 @@ class Node(
         r.end()
         if (index !in 0 until MAX_PARTS) throw IOException("part index")
         val ns = NS_PART + c.id
-        val pending = kv.list(ns)
+        val store: Kv = if (c.id in privateChats) ramKv else kv // private chats: parts stay in RAM
+        val pending = store.list(ns)
         if (pending.sumOf { it.second.size.toLong() } + data.size > MAX_PENDING_PER_CONTACT) throw IOException("too much pending")
-        kv.put(ns, "$fileId.$index", Out().i64(now()).bytes(data).done())
+        store.put(ns, "$fileId.$index", Out().i64(now()).bytes(data).done())
         completeFile(c, fileId)
     }
 
@@ -709,31 +801,36 @@ class Node(
         // Optional trailing fields (1.1): reply id, voice duration. Anything further is ignored.
         val replyTo = readReplyTo(r)
         val duration = runCatching { if (r.more()) r.i32() else 0 }.getOrDefault(0).coerceIn(0, MAX_VOICE_MS)
+        val (flags, timer) = readExt(r, textOnly = !(mime.startsWith("image/") || mime.startsWith("video/")))
         if (size !in 1..MAX_FILE.toLong() || parts !in 1..MAX_PARTS) throw IOException("file meta")
         val meta = Out().i64(now()).bytes(Out().raw(Codec.unhex(m.id)).i64(m.sentAt).str(m.text).str(name).str(mime).i64(size).raw(hash).i32(parts)
-            .bytes(replyBytes(replyTo)).i32(duration).done()).done()
-        kv.put(NS_FILEMETA + c.id, fileId, meta)
+            .bytes(replyBytes(replyTo)).i32(duration).u8(flags).i32(timer).done()).done()
+        // A private file's description stays in RAM too; the contact is in private mode from then on.
+        if (flags and FLAG_PRIVATE != 0) { enterPrivate(c); ramKv.put(NS_FILEMETA + c.id, fileId, meta) } else kv.put(NS_FILEMETA + c.id, fileId, meta)
         completeFile(c, fileId)
     }
 
     private fun completeFile(c: Contact, fileId: String) {
-        val metaB = kv.get(NS_FILEMETA + c.id, fileId) ?: return
+        // Parts and description are in RAM for private chats, in [kv] otherwise (or in both, if the mode changed in between).
+        val metaB = ramKv.get(NS_FILEMETA + c.id, fileId) ?: kv.get(NS_FILEMETA + c.id, fileId) ?: return
         val mr = In(metaB); mr.i64(); val r = In(mr.bytes())
         val msgId = Codec.hex(r.raw(16)); val at = r.i64(); val caption = r.str(); val name = r.str(); val mime = r.str()
         val size = r.i64(); val hash = r.raw(32); val parts = r.i32()
         val replyTo = readReplyTo(r)
         val duration = if (r.more()) r.i32() else 0
+        val flags = if (r.more()) r.u8() else 0
+        val timer = if (r.more()) r.i32() else 0
         val ns = NS_PART + c.id
         val chunks = ArrayList<ByteArray>(parts)
         for (i in 0 until parts) {
-            val p = kv.get(ns, "$fileId.$i") ?: return // not complete yet
+            val p = ramKv.get(ns, "$fileId.$i") ?: kv.get(ns, "$fileId.$i") ?: return // not complete yet
             val pr = In(p); pr.i64(); chunks += pr.bytes()
         }
         val data = java.io.ByteArrayOutputStream(size.toInt()).apply { chunks.forEach { write(it) } }.toByteArray()
-        for (i in 0 until parts) kv.delete(ns, "$fileId.$i")
-        kv.delete(NS_FILEMETA + c.id, fileId)
+        for (i in 0 until parts) { ramKv.delete(ns, "$fileId.$i"); kv.delete(ns, "$fileId.$i") }
+        ramKv.delete(NS_FILEMETA + c.id, fileId); kv.delete(NS_FILEMETA + c.id, fileId)
         if (data.size.toLong() != size || !sha256(data).contentEquals(hash)) { events.log("file dropped: hash mismatch"); return }
-        events.onMessage(c, Message(msgId, c.id, caption, true, at, c.expireSec, Attachment(fileId, name, mime, size, data), replyTo, duration))
+        events.onMessage(c, Message(msgId, c.id, caption, true, at, c.expireSec, Attachment(fileId, name, mime, size, data), replyTo, duration, flags, timer))
     }
 
     /** Parts and file messages that never completed are dropped after the mailbox TTL. */
@@ -790,6 +887,45 @@ class Node(
         messageIds.chunked(MAX_RECEIPT_IDS).forEach { part ->
             send(c, Out().u8(I_RECEIPT).u8(kind).i32(part.size).also { o -> part.forEach { o.raw(Codec.unhex(it)) } }.done(), directAttempts = 2)
         }
+    }
+
+    /** View-once photo opened (wire RECEIPT kind 3). Sent even with receipts off: the feature needs it. */
+    fun sendOpened(c: Contact, messageId: String) {
+        if (!c.supportsViewOnce || c.blocked) return
+        send(c, Out().u8(I_RECEIPT).u8(Receipt.OPENED).i32(1).raw(Codec.unhex(messageId)).done(), directAttempts = 2)
+    }
+
+    // ---------------------------------------------------------------- private mode (RAM only)
+
+    fun isPrivate(c: Contact): Boolean = c.id in privateChats
+
+    private fun enterPrivate(c: Contact) { if (privateChats.add(c.id)) events.onControl(c, CONTROL_ON) }
+
+    /** Drops what a private chat holds in RAM here (pending file parts). */
+    private fun clearPrivateRam(c: Contact) {
+        listOf(NS_PART + c.id, NS_FILEMETA + c.id).forEach { ns -> ramKv.list(ns).forEach { ramKv.delete(ns, it.first) } }
+    }
+
+    /**
+     * Turns private mode on or off for the chat and tells the contact (direct path only). Turning it on fails
+     * if the contact cannot be reached now. Turning it off never fails: the local side is off either way.
+     */
+    fun setPrivateMode(c: Contact, on: Boolean) {
+        if (on) {
+            if (!c.supportsPrivate) throw IOException("Update needed")
+            send(c, Out().u8(I_CONTROL).u8(CONTROL_ON).done(), useMailbox = false, directAttempts = 2)
+            privateChats += c.id
+        } else {
+            val was = privateChats.remove(c.id)
+            clearPrivateRam(c)
+            if (was && c.supportsPrivate) runCatching { send(c, Out().u8(I_CONTROL).u8(CONTROL_OFF).done(), useMailbox = false, directAttempts = 1) }
+        }
+    }
+
+    /** Tells the contact to wipe the chat's private messages (we wiped ours). Best effort, direct only. */
+    fun sendWipe(c: Contact) {
+        if (c.id !in privateChats || !c.supportsPrivate || c.blocked) return
+        runCatching { send(c, Out().u8(I_CONTROL).u8(CONTROL_WIPE).done(), useMailbox = false, directAttempts = 1) }
     }
 
     /**
@@ -985,12 +1121,23 @@ class Node(
      */
     fun waitMailbox(maxWaitMs: Int = MailboxProtocol.MAX_WAIT_MS): Int {
         if (mailboxOnion.isEmpty()) return -1
-        val cs = contacts.values.filter { it.queueReady }.sortedByDescending { it.createdAt }.take(MailboxProtocol.MAX_SECRETS_PER_GET)
-        if (cs.isEmpty()) return -1
-        val f = Out().u8(MailboxProtocol.VERSION).u8(MailboxProtocol.WAIT).i32(maxWaitMs).i32(cs.size).also { o -> cs.forEach { o.raw(it.myQueueSecret) } }.done()
-        // One dedicated Tor stream, reused between waits.
-        val r = In(request(mailboxOnion, f, attempts = 2, isolation = "wait"))
-        if (r.u8() != MailboxProtocol.R_LIST) throw IOException("mailbox refused WAIT")
+        val all = contacts.values.filter { it.queueReady }.sortedByDescending { it.createdAt }
+        if (all.isEmpty()) return -1
+        var cs = all.take(waitQueues)
+        fun ask(list: List<Contact>): In {
+            val f = Out().u8(MailboxProtocol.VERSION).u8(MailboxProtocol.WAIT).i32(maxWaitMs).i32(list.size).also { o -> list.forEach { o.raw(it.myQueueSecret) } }.done()
+            // One dedicated Tor stream, reused between waits.
+            return In(request(mailboxOnion, f, attempts = 2, isolation = "wait"))
+        }
+        var r = ask(cs)
+        var code = r.u8()
+        // A mailbox older than 1.2 takes 8 queues per WAIT and refuses more: use 8 from now on.
+        if (code != MailboxProtocol.R_LIST && cs.size > MailboxProtocol.MAX_SECRETS_PER_GET) {
+            waitQueues = MailboxProtocol.MAX_SECRETS_PER_GET
+            cs = all.take(waitQueues)
+            r = ask(cs); code = r.u8()
+        }
+        if (code != MailboxProtocol.R_LIST) throw IOException("mailbox refused WAIT")
         val n = r.i32()
         val acks = HashMap<Int, MutableList<String>>()
         repeat(n) {
@@ -1196,7 +1343,16 @@ class Node(
                 )
                 val ir = In(inner)
                 when (ir.u8()) {
-                    I_TEXT -> { val m = readMsg(ir, contact); events.onMessage(contact, m.copy(replyTo = readReplyTo(ir))) }
+                    I_TEXT -> {
+                        val m = readMsg(ir, contact); val reply = readReplyTo(ir); val (fl, tm) = readExt(ir, textOnly = true)
+                        val pv = readPreview(ir, m.text)
+                        // Private messages never travel through the mailbox; a copy from there is not ours to show.
+                        if (fl and FLAG_PRIVATE != 0 && fromMailbox) events.log("private message from mailbox dropped")
+                        else {
+                            if (fl and FLAG_PRIVATE != 0) enterPrivate(contact)
+                            events.onMessage(contact, m.copy(replyTo = reply, flags = fl, timerSec = tm, preview = if (fl and FLAG_PRIVATE == 0) pv else null))
+                        }
+                    }
                     I_SETTINGS -> { contact.expireSec = ir.i32().coerceIn(0, 365 * 86400); save(contact) }
                     I_STATE -> { readState(ir, contact); save(contact); reauth = true }
                     I_FILE_PART -> onFilePart(contact, ir)
@@ -1226,6 +1382,9 @@ class Node(
                         // Off means off both ways: nothing is shown and nothing is stored.
                         if (receiptsEnabled && (kind == Receipt.DELIVERED || kind == Receipt.READ)) {
                             if (allowInbound(contact, ephemeral = true)) events.onReceipt(contact, kind, ids)
+                        } else if (kind == Receipt.OPENED) {
+                            // View once: needed for the sender's no-trace rule, so honoured whatever the receipts setting says.
+                            if (allowInbound(contact, ephemeral = true)) events.onReceipt(contact, kind, ids)
                         }
                     }
                     I_TYPING -> {
@@ -1239,6 +1398,16 @@ class Node(
                         if (jpeg.size > MAX_AVATAR || !sha256(jpeg).contentEquals(hash)) events.log("avatar ignored: size or hash")
                         else if (!allowInbound(contact, ephemeral = true)) events.log("avatar dropped: rate limit")
                         else events.onAvatar(contact, jpeg.takeIf { it.isNotEmpty() })
+                    }
+                    I_CONTROL -> {
+                        val op = ir.u8()
+                        // Direct path only: a copy from the mailbox is stale, and a wipe must not outlive the moment.
+                        if (!fromMailbox && allowInbound(contact, ephemeral = true)) when (op) {
+                            CONTROL_ON -> enterPrivate(contact)
+                            CONTROL_OFF -> { if (privateChats.remove(contact.id)) { clearPrivateRam(contact); events.onControl(contact, CONTROL_OFF) } }
+                            CONTROL_WIPE -> { clearPrivateRam(contact); events.onControl(contact, CONTROL_WIPE) }
+                            else -> {}
+                        }
                     }
                     // A newer version's message type: accepted (so it is not retried) and ignored.
                     else -> events.log("ignored unknown message type")
@@ -1279,7 +1448,19 @@ class Node(
         const val MAX_SDP = 12 * 1024
         /** Features announced in HELLO/STATE. */
         const val CAP_V11 = 1
-        private const val CAPS = CAP_V11
+        /** View once and per-message timers. */
+        const val CAP_VIEW_ONCE = 2
+        /** Private mode. */
+        const val CAP_PRIVATE_MODE = 4
+        /** Link previews built by the sender. */
+        const val CAP_LINK_PREVIEW = 8
+        private const val CAPS = CAP_V11 or CAP_VIEW_ONCE or CAP_PRIVATE_MODE or CAP_LINK_PREVIEW
+        const val FLAG_VIEW_ONCE = 1
+        const val FLAG_PRIVATE = 2
+        const val MAX_TIMER_SEC = 30 * 86400
+        const val CONTROL_ON = 1
+        const val CONTROL_OFF = 2
+        const val CONTROL_WIPE = 3
         const val MAX_EMOJI_BYTES = 16
         /** Profile photo: 256x256 JPEG, at most 40 KB (one mailbox-safe frame). */
         const val MAX_AVATAR = 40 * 1024
@@ -1330,6 +1511,7 @@ class Node(
         private const val I_RECEIPT = 11
         private const val I_TYPING = 12
         private const val I_AVATAR = 13
+        private const val I_CONTROL = 14
 
         /** Strips control and direction-override characters from names (audit L-07). */
         fun cleanName(s: String): String =
@@ -1392,6 +1574,12 @@ class InboundServer(
     private val deadlineMs: Long = 15_000,
     private val idleMs: Long = 30_000,
     private val maxLifeMs: Long = 10 * 60_000,
+    /**
+     * Makes the accept and connection threads. The default is a daemon platform thread per connection (Android, Java 17).
+     * The mailbox process on Java 21 passes a virtual-thread factory, so thousands of parked WAITs cost kilobytes each.
+     */
+    private val threads: java.util.concurrent.ThreadFactory = java.util.concurrent.ThreadFactory { r -> Thread(r).apply { isDaemon = true } },
+    backlog: Int = 50,
 ) {
     constructor(node: Node, events: NodeEvents) : this(node::handle, events::log)
 
@@ -1399,18 +1587,18 @@ class InboundServer(
     private val reaper = Executors.newSingleThreadScheduledExecutor { r -> Thread(r, "swell-reaper").apply { isDaemon = true } }
 
     // 127.0.0.1 explicitly: on Android getLoopbackAddress() is ::1 and Tor forwards to IPv4.
-    private val server = ServerSocket(port, 50, InetAddress.getByAddress(byteArrayOf(127, 0, 0, 1)))
+    private val server = ServerSocket(port, backlog, InetAddress.getByAddress(byteArrayOf(127, 0, 0, 1)))
     val port: Int get() = server.localPort
 
     fun start() {
-        thread(name = "swell-accept", isDaemon = true) {
+        threads.newThread {
             while (!server.isClosed) {
                 val s = try { server.accept() } catch (e: IOException) { break }
                 if (!slots.tryAcquire()) { runCatching { s.close() }; continue }
                 open += s
                 // Hard stop for the whole connection, whatever the peer does.
                 val kill = reaper.schedule({ runCatching { s.close() } }, maxLifeMs, TimeUnit.MILLISECONDS)
-                thread(name = "swell-conn", isDaemon = true) {
+                threads.newThread {
                     try {
                         s.use {
                             // Several frames per connection: the first within the deadline, later ones after
@@ -1431,9 +1619,9 @@ class InboundServer(
                         kill.cancel(false)
                         slots.release()
                     }
-                }
+                }.start()
             }
-        }
+        }.start()
     }
 
     private val open = java.util.Collections.newSetFromMap(ConcurrentHashMap<Socket, Boolean>())
@@ -1447,3 +1635,9 @@ class InboundServer(
 
 /** Server on a fixed local port (mailbox). */
 fun InboundServerAt(port: Int, handler: (ByteArray) -> ByteArray, log: (String) -> Unit) = InboundServer(handler, log, port)
+
+/** The mailbox's server with its scale knobs: connection cap, thread factory (virtual threads on Java 21) and accept backlog. */
+fun ScaledInboundServer(
+    port: Int, handler: (ByteArray) -> ByteArray, maxConnections: Int, threads: java.util.concurrent.ThreadFactory,
+    backlog: Int = 1024, log: (String) -> Unit = {},
+) = InboundServer(handler, log, port, maxConnections, threads = threads, backlog = backlog)

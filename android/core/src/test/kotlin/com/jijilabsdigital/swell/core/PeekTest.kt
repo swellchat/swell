@@ -109,8 +109,10 @@ class WaitTest {
 
     @Test
     fun globalCapRejectsAndCapsDuration() {
-        val threads = (1..MailboxProtocol.MAX_WAITS).map { Thread { srv.handle(waitReq(Codec.random(32), ms = 1_500)) }.also { it.start() } }
+        val srv = MailboxServer(MemoryMailboxStore(), powBits = 8, maxWaits = 48) // the cap is configurable
+        val threads = (1..48).map { Thread { srv.handle(waitReq(Codec.random(32), ms = 1_500)) }.also { it.start() } }
         Thread.sleep(400)
+        assertEquals(48, srv.waiters())
         assertEquals(0xFF, In(srv.handle(waitReq(Codec.random(32), ms = 100))).u8(), "over the global cap")
         threads.forEach { it.join(5_000) }
         assertEquals(0, count(srv.handle(waitReq(Codec.random(32), ms = -5))), "negative wait is clamped")
@@ -130,6 +132,10 @@ class WaitManyTest {
         srv.handle(Out().u8(2).u8(MailboxProtocol.PUT).raw(MailboxProtocol.queueId(ss[2])).bytes(byteArrayOf(5)).done())
         th.join(5_000)
         val r = In(resp); assertEquals(MailboxProtocol.R_LIST, r.u8()); assertEquals(1, r.i32()); assertEquals(2, r.i32())
-        assertEquals(0xFF, In(srv.handle(Out().u8(2).u8(MailboxProtocol.WAIT).i32(10).i32(9).also { o -> repeat(9) { o.raw(ss[0]) } }.done())).u8(), "more than 8 queues")
+        // 64 queues per WAIT (mailbox 1.2); 65 is refused; GET stays at 8.
+        fun wait(n: Int) = srv.handle(Out().u8(2).u8(MailboxProtocol.WAIT).i32(10).i32(n).also { o -> repeat(n) { o.raw(ss[0]) } }.done())
+        assertEquals(MailboxProtocol.R_LIST, In(wait(9)).u8()); assertEquals(MailboxProtocol.R_LIST, In(wait(64)).u8())
+        assertEquals(0xFF, In(wait(65)).u8(), "more than 64 queues")
+        assertEquals(0xFF, In(srv.handle(Out().u8(2).u8(MailboxProtocol.GET).i32(9).also { o -> repeat(9) { o.raw(ss[0]) } }.done())).u8(), "GET still takes 8")
     }
 }

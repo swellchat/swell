@@ -57,6 +57,11 @@ import com.jijilabsdigital.swell.Swell
 @Composable
 fun AddContactScreen(incoming: String?, onBack: () -> Unit, onConnected: (String) -> Unit) {
     var tab by remember { mutableIntStateOf(if (incoming != null) 1 else 0) }
+    // An invite link on the clipboard is offered here too (only when no link opened this screen).
+    if (incoming == null) ClipInvitePrompt(firstOpenOnly = false) { code ->
+        tab = 1
+        Swell.accept(code, onDone = { c -> onConnected(c.id) }, onError = { Swell.toast(it) })
+    }
     Scaffold(
         topBar = {
             TopAppBar(

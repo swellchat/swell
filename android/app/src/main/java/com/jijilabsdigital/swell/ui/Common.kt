@@ -58,52 +58,117 @@ import com.google.zxing.PlanarYUVLuminanceSource
 import com.google.zxing.common.HybridBinarizer
 import com.google.zxing.qrcode.QRCodeWriter
 import com.google.zxing.qrcode.decoder.ErrorCorrectionLevel
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.jijilabsdigital.swell.R
+import com.jijilabsdigital.swell.Swell
 import java.util.concurrent.Executors
 
-/** Swell "night ocean" palette, taken from the pixel-art icon. */
-object Ocean {
-    val Deep = Color(0xFF0A0B22)
-    val Navy = Color(0xFF121231)
-    val Raised = Color(0xFF1B2152)
-    val Line = Color(0xFF2A3358)
-    val Electric = Color(0xFF2390DC)
-    val Cyan = Color(0xFF06B6D4)
-    val Foam = Color(0xFFB7E1F2)
-    val Text = Color(0xFFEAF3FF)
-    val Muted = Color(0xFF93A5CC)
-    val Danger = Color(0xFFFF6B7A)
-    val Bubble = Brush.linearGradient(listOf(Color(0xFF2563EB), Color(0xFF06B6D4)))
-    val Sky = Brush.verticalGradient(listOf(Color(0xFF070818), Color(0xFF121231), Color(0xFF1B2A6B)))
+/** One look: Swell Navy, Midnight (true black), Swell Light or Mist, as in the iOS appearance settings. */
+class Palette(
+    val dark: Boolean, val deep: Color, val incoming: Color, val card: Color, val line: Color,
+    val text: Color, val muted: Color, val foam: Color, val sky: Brush,
+)
+
+object Palettes {
+    // Swell: the same values as the iOS Theme (dark navy, soft mist in light).
+    val SwellNavy = Palette(true, Color(0xFF0A0B22), Color(0xFF121231), Color(0xFF1B2152), Color(0xFF2A3358), Color(0xFFEAF3FF), Color(0xFF93A5CC), Color(0xFFB7E1F2),
+        Brush.verticalGradient(listOf(Color(0xFF070818), Color(0xFF121231), Color(0xFF1B2A6B))))
+    val SwellLight = Palette(false, Color(0xFFF2F6FA), Color(0xFFE6ECF3), Color(0xFFFFFFFF), Color(0xFFD5DDE8), Color(0xFF0F1B2D), Color(0xFF5B6B85), Color(0xFF0B3A63),
+        Brush.verticalGradient(listOf(Color(0xFFF7FAFD), Color(0xFFE9F1F8), Color(0xFFD3E6F5))))
+    // Midnight: true black for OLED screens.
+    val Midnight = Palette(true, Color(0xFF000000), Color(0xFF0E0F14), Color(0xFF16181F), Color(0xFF272A33), Color(0xFFEDEFF5), Color(0xFF8A90A0), Color(0xFFC3D4F0),
+        Brush.verticalGradient(listOf(Color(0xFF000000), Color(0xFF07080C), Color(0xFF0F1220))))
+    // Mist: a cooler, greyer light look.
+    val Mist = Palette(false, Color(0xFFE9EDF2), Color(0xFFDCE2EA), Color(0xFFF7F9FB), Color(0xFFC8D0DB), Color(0xFF1B2433), Color(0xFF5E6B80), Color(0xFF23405F),
+        Brush.verticalGradient(listOf(Color(0xFFF1F4F8), Color(0xFFE3E8EF), Color(0xFFD2DAE6))))
 }
 
-val Brand = Ocean.Cyan
+/** Accent choices: Swell gradient (blue to cyan, default), Teal, Indigo, Violet, Coral, Amber. Pair = accent and its gradient partner. */
+val ACCENT_PAIRS = listOf(
+    Color(0xFF2390DC) to Color(0xFF06B6D4), Color(0xFF0EA5A4) to Color(0xFF34D399), Color(0xFF6366F1) to Color(0xFF8B9CFF),
+    Color(0xFF8B5CF6) to Color(0xFFC084FC), Color(0xFFF2705B) to Color(0xFFFFA48F), Color(0xFFF5A524) to Color(0xFFFFD166),
+)
+val ACCENTS = ACCENT_PAIRS.map { it.first }
+val ACCENT_NAMES = listOf("Swell", "Teal", "Indigo", "Violet", "Coral", "Amber")
+
+val LocalPalette = androidx.compose.runtime.staticCompositionLocalOf { Palettes.SwellNavy }
+val LocalAccent = androidx.compose.runtime.staticCompositionLocalOf { ACCENTS[0] }
+
+/** Colours for the current look. Everything here follows the chosen appearance and accent. */
+object Ocean {
+    val Deep: Color @Composable get() = LocalPalette.current.deep
+    val Navy: Color @Composable get() = LocalPalette.current.incoming
+    val Raised: Color @Composable get() = LocalPalette.current.card
+    val Line: Color @Composable get() = LocalPalette.current.line
+    val Text: Color @Composable get() = LocalPalette.current.text
+    val Muted: Color @Composable get() = LocalPalette.current.muted
+    val Foam: Color @Composable get() = LocalPalette.current.foam
+    val Sky: Brush @Composable get() = LocalPalette.current.sky
+    /** The accent (primary) colour and a lighter companion for gradients. */
+    val Electric: Color @Composable get() = LocalAccent.current
+    val Cyan: Color @Composable get() = ACCENT_PAIRS.firstOrNull { it.first == LocalAccent.current }?.second ?: lighten(LocalAccent.current)
+    val Danger = Color(0xFFFF6B7A)
+    val Bubble: Brush @Composable get() = Brush.linearGradient(listOf(if (LocalAccent.current == ACCENTS[0]) Color(0xFF2563EB) else darken(LocalAccent.current), Cyan))
+    /** Fixed navy for text on bright accent surfaces. */
+    val OnAccent = Color(0xFF0A0B22)
+}
+
+fun lighten(c: Color, f: Float = 0.25f) = Color(c.red + (1 - c.red) * f, c.green + (1 - c.green) * f, c.blue + (1 - c.blue) * f)
+fun darken(c: Color, f: Float = 0.18f) = Color(c.red * (1 - f), c.green * (1 - f), c.blue * (1 - f))
 
 @Composable
 fun SwellTheme(content: @Composable () -> Unit) {
     val base = Typography()
-    MaterialTheme(
-        colorScheme = darkColorScheme(
-            primary = Ocean.Electric, onPrimary = Color.White,
-            primaryContainer = Ocean.Raised, onPrimaryContainer = Ocean.Foam,
-            secondary = Ocean.Electric, onSecondary = Color.White,
-            secondaryContainer = Ocean.Raised, onSecondaryContainer = Ocean.Foam,
-            background = Ocean.Deep, onBackground = Ocean.Text,
-            surface = Ocean.Deep, onSurface = Ocean.Text,
-            surfaceVariant = Ocean.Raised, onSurfaceVariant = Ocean.Muted,
-            surfaceContainer = Ocean.Navy, surfaceContainerHigh = Ocean.Raised,
-            outline = Ocean.Line, outlineVariant = Ocean.Line,
-            error = Ocean.Danger,
-        ),
-        typography = base,
-        content = content,
+    val look by Swell.look.collectAsStateWithLifecycle()
+    val system = androidx.compose.foundation.isSystemInDarkTheme()
+    val p = when (look.theme) {
+        "navy" -> Palettes.SwellNavy
+        "midnight" -> Palettes.Midnight
+        "light" -> Palettes.SwellLight
+        "mist" -> Palettes.Mist
+        else -> if (system) Palettes.SwellNavy else Palettes.SwellLight // follow the system
+    }
+    val accent = ACCENTS[look.accent.coerceIn(0, ACCENTS.lastIndex)]
+    val scheme = if (p.dark) androidx.compose.material3.darkColorScheme(
+        primary = accent, onPrimary = Color.White,
+        primaryContainer = p.card, onPrimaryContainer = p.foam,
+        secondary = accent, onSecondary = Color.White,
+        secondaryContainer = p.card, onSecondaryContainer = p.foam,
+        background = p.deep, onBackground = p.text,
+        surface = p.deep, onSurface = p.text,
+        surfaceVariant = p.card, onSurfaceVariant = p.muted,
+        surfaceContainer = p.incoming, surfaceContainerHigh = p.card,
+        outline = p.line, outlineVariant = p.line, error = Ocean.Danger,
+    ) else androidx.compose.material3.lightColorScheme(
+        primary = darken(accent, 0.12f), onPrimary = Color.White,
+        primaryContainer = p.incoming, onPrimaryContainer = p.foam,
+        secondary = accent, onSecondary = Color.White,
+        secondaryContainer = p.incoming, onSecondaryContainer = p.foam,
+        background = p.deep, onBackground = p.text,
+        surface = p.deep, onSurface = p.text,
+        surfaceVariant = p.card, onSurfaceVariant = p.muted,
+        surfaceContainer = p.incoming, surfaceContainerHigh = p.card,
+        outline = p.line, outlineVariant = p.line, error = Color(0xFFD93A4A),
     )
+    // System bar icons follow the chosen look (dark icons on a light look).
+    val view = androidx.compose.ui.platform.LocalView.current
+    if (!view.isInEditMode) androidx.compose.runtime.SideEffect {
+        val w = (view.context as? android.app.Activity)?.window ?: return@SideEffect
+        val c = androidx.core.view.WindowCompat.getInsetsController(w, view)
+        c.isAppearanceLightStatusBars = !p.dark; c.isAppearanceLightNavigationBars = !p.dark
+    }
+    androidx.compose.runtime.CompositionLocalProvider(LocalPalette provides p, LocalAccent provides accent) {
+        MaterialTheme(colorScheme = scheme, typography = base, content = content)
+    }
 }
 
 /** The Swell mark (white), as on the iOS welcome and empty states. */
 @Composable
 fun BrandMark(size: Dp, modifier: Modifier = Modifier) {
-    Image(androidx.compose.ui.res.painterResource(R.drawable.brand_mark), null, modifier.size(size))
+    // The mark is white; on a light look it takes the accent colour.
+    val p = LocalPalette.current
+    Image(androidx.compose.ui.res.painterResource(R.drawable.brand_mark), null, modifier.size(size),
+        colorFilter = if (p.dark) null else androidx.compose.ui.graphics.ColorFilter.tint(LocalAccent.current))
 }
 
 /** Gradient circle with a Material icon: the Android counterpart of iOS "Hero". */
@@ -119,7 +184,7 @@ private val AVATARS = listOf(Color(0xFF2390DC), Color(0xFF06B6D4), Color(0xFF636
 fun avatarColor(id: String): Color = AVATARS[(id.hashCode() and 0x7fffffff) % AVATARS.size]
 
 /** Soft gradient for initials avatars, one per contact (like the iOS Avatar). */
-fun avatarBrush(id: String): Brush { val c = avatarColor(id); return Brush.linearGradient(listOf(c, c.copy(alpha = 0.65f).compositeOver(Ocean.Deep))) }
+fun avatarBrush(id: String): Brush { val c = avatarColor(id); return Brush.linearGradient(listOf(c, c.copy(alpha = 0.65f).compositeOver(Color(0xFF0A0B22)))) }
 
 /** Up to two initials. */
 fun initials(name: String): String = name.trim().split(' ').filter { it.isNotEmpty() }.take(2).joinToString("") { it.take(1) }.uppercase().ifEmpty { "?" }

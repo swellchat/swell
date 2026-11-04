@@ -27,6 +27,8 @@ class NodeTest {
         val receipts = CopyOnWriteArrayList<String>()
         val typing = CopyOnWriteArrayList<Boolean>()
         val avatars = CopyOnWriteArrayList<Int>() // size of the JPEG, -1 = removed
+        val controls = CopyOnWriteArrayList<Int>()
+        override fun onControl(contact: Contact, op: Int) { controls += op }
         override fun onAvatar(contact: Contact, jpeg: ByteArray?) { avatars += jpeg?.size ?: -1 }
         override fun onReaction(contact: Contact, messageId: String, emoji: String, add: Boolean) { reactions += "$messageId $emoji $add" }
         override fun onModify(contact: Contact, op: Int, messageId: String, text: String) { modifies += "$op $messageId $text" }
@@ -765,6 +767,152 @@ class NodeTest {
         assertTrue((System.nanoTime() - t1) / 1_000_000 < 200)
     }
 
+
+    @Test
+    fun linkPreviewTravelsWithTextAndIsCheckedByTheReceiver() {
+        val (a, b, c) = pair()
+        assertTrue(c.second.supportsLinkPreview)
+        val thumb = ByteArray(5000) { it.toByte() }
+        val url = "https://example.org/page"
+        b.node.sendText(c.second, "look $url", preview = LinkPreview(url, "Example page", "example.org", thumb))
+        waitFor { a.rec.msgs.size == 2 }
+        val pv = a.rec.msgs.last().preview!!
+        assertEquals("Example page", pv.title); assertEquals("example.org", pv.site); assertTrue(thumb.contentEquals(pv.thumb))
+        // A preview whose link is not in the text is dropped by the sender (and would be by the receiver).
+        b.node.sendText(c.second, "no link here", preview = LinkPreview(url, "x", "y", ByteArray(0)))
+        waitFor { a.rec.msgs.size == 3 }
+        assertEquals(null, a.rec.msgs.last().preview)
+        // http and oversize are refused when decoding.
+        assertEquals(null, LinkPreview.decode(LinkPreview("http://example.org/", "t", "s", ByteArray(0)).encode()))
+        assertEquals(null, LinkPreview.decode(Out().u8(1).str("https://example.org/").str("t").str("s").bytes(ByteArray(LinkPreview.MAX_THUMB + 1)).done()))
+        // Never to a contact without the capability, and never in private mode.
+        c.second.caps = Node.CAP_V11
+        b.node.sendText(c.second, "again $url", preview = LinkPreview(url, "t", "s", ByteArray(0)))
+        waitFor { a.rec.msgs.size == 4 }
+        assertEquals(null, a.rec.msgs.last().preview)
+    }
+
+    // ------------------------------------------------------------ 1.2: view once, timers, private mode
+
+    /** Records every write, so a test can prove what did (not) reach storage. */
+    private class RecordingKv(private val inner: Kv = MemoryKv()) : Kv by inner {
+        val puts = CopyOnWriteArrayList<Triple<String, String, ByteArray>>()
+        override fun put(ns: String, key: String, value: ByteArray) { puts += Triple(ns, key, value); inner.put(ns, key, value) }
+    }
+
+    private fun contains(hay: ByteArray, needle: ByteArray): Boolean {
+        outer@ for (i in 0..hay.size - needle.size) { for (j in needle.indices) if (hay[i + j] != needle[j]) continue@outer; return true }
+        return false
+    }
+
+    @Test
+    fun viewOnceAndTimerTravelAsTrailingFields() {
+        val (a, b, c) = pair()
+        assertTrue(c.first.supportsViewOnce && c.second.supportsViewOnce && c.first.supportsPrivate)
+        val photo = ByteArray(3000) { (it * 7).toByte() }
+        val sent = b.node.sendFile(c.second, "p.jpg", "image/jpeg", photo, "", flags = Node.FLAG_VIEW_ONCE, timerSec = 0)
+        waitFor { a.rec.files.size == 1 }
+        val got = a.rec.msgs.last()
+        assertTrue(got.viewOnce && !got.isPrivate)
+        assertEquals(sent.id, got.id)
+        assertTrue(photo.contentEquals(got.file!!.data!!))
+        // A per-message timer on text and on a file.
+        b.node.sendText(c.second, "tick", timerSec = 60)
+        waitFor { a.rec.msgs.size == 3 }
+        assertEquals(60, a.rec.msgs.last().timerSec); assertEquals(0, a.rec.msgs.last().flags)
+        b.node.sendFile(c.second, "q.jpg", "image/jpeg", photo, "cap", replyTo = a.rec.msgs.first().id, timerSec = 10)
+        waitFor { a.rec.files.size == 2 }
+        assertEquals(10, a.rec.msgs.last().timerSec); assertEquals(a.rec.msgs.first().id, a.rec.msgs.last().replyTo)
+        // View once is only for photos and videos: on any other file the flag is dropped by the sender.
+        b.node.sendFile(c.second, "n.txt", "text/plain", "x".toByteArray(), "", flags = Node.FLAG_VIEW_ONCE)
+        waitFor { a.rec.files.size == 3 }
+        assertFalse(a.rec.msgs.last().viewOnce)
+        // View once on a text is ignored by the receiver.
+        b.node.sendInner(c.second, Out().u8(2).raw(Codec.random(16)).i64(1).i32(0).str("t").bytes(ByteArray(0)).u8(1).i32(0).done())
+        waitFor { a.rec.msgs.size == 5 }
+        assertFalse(a.rec.msgs.last().viewOnce)
+    }
+
+    @Test
+    fun featuresAreRefusedForContactsThatDidNotAnnounceThem() {
+        val (_, b, c) = pair()
+        c.second.caps = Node.CAP_V11 // an older 1.1 app
+        val e = assertFailsWith<IOException> { b.node.sendFile(c.second, "p.jpg", "image/jpeg", ByteArray(100), "", flags = Node.FLAG_VIEW_ONCE) }
+        assertEquals("Update needed", e.message)
+        assertEquals("Update needed", assertFailsWith<IOException> { b.node.sendText(c.second, "x", timerSec = 10) }.message)
+        assertEquals("Update needed", assertFailsWith<IOException> { b.node.sendText(c.second, "x", flags = Node.FLAG_PRIVATE) }.message)
+        assertEquals("Update needed", assertFailsWith<IOException> { b.node.setPrivateMode(c.second, true) }.message)
+        assertFalse(b.node.isPrivate(c.second))
+    }
+
+    @Test
+    fun openedReceiptIsHonouredEvenWithReceiptsOff() {
+        val (a, b, c) = pair()
+        assertFalse(a.node.receiptsEnabled || b.node.receiptsEnabled)
+        val id = a.rec.msgs.single().id
+        a.node.sendOpened(c.first, id)
+        waitFor { b.rec.receipts.size == 1 }
+        assertEquals(listOf("3 $id"), b.rec.receipts)
+        // Reading receipts stay silent.
+        a.node.sendReceipt(c.first, Receipt.READ, listOf(id))
+        Thread.sleep(100)
+        assertEquals(1, b.rec.receipts.size)
+    }
+
+    @Test
+    fun privateModeKeepsMessagesAndFilePartsOutOfStorage() {
+        val akv = RecordingKv()
+        val a = Peer("privapeer", akv); val b = Peer("privbpeer")
+        val bobsAlice = b.node.acceptInvite(a.node.createInvite(), "hello")
+        waitFor { a.rec.got.isNotEmpty() && a.node.contacts().singleOrNull()?.supportsPrivate == true && bobsAlice.supportsPrivate }
+        val c = a.node.contacts().single()
+        val before = akv.puts.size
+        b.node.setPrivateMode(bobsAlice, true)
+        waitFor { a.node.isPrivate(c) }
+        assertTrue(a.node.isPrivate(c) && b.node.isPrivate(bobsAlice))
+        assertEquals(listOf(Node.CONTROL_ON), a.rec.controls)
+        val marker = "marker-text-4f1c9a"
+        b.node.sendText(bobsAlice, marker, flags = Node.FLAG_PRIVATE)
+        val photo = ByteArray(120_000) { ((it * 31) xor 0x5a).toByte() } // several parts
+        b.node.sendFile(bobsAlice, "p.jpg", "image/jpeg", photo, "capt-9e77", flags = Node.FLAG_PRIVATE)
+        waitFor { a.rec.files.size == 1 && a.rec.msgs.size == 3 }
+        val text = a.rec.msgs.first { it.text == marker }
+        assertTrue(text.isPrivate)
+        assertTrue(photo.contentEquals(a.rec.msgs.last().file!!.data!!), "media arrives intact, in memory")
+        // Nothing but ratchet state was written on the receiving side: no parts, no file description, no plaintext.
+        val writes = akv.puts.drop(before)
+        assertTrue(writes.none { it.first.startsWith("fpart.") || it.first.startsWith("fmeta.") }, "no pending file data on disk: ${writes.map { it.first }.distinct()}")
+        assertTrue(writes.none { contains(it.third, marker.toByteArray()) || contains(it.third, "capt-9e77".toByteArray()) || contains(it.third, photo.copyOf(2000)) })
+        // The sender's node stored nothing of it either (its own storage only gets ratchet state).
+        assertTrue(b.kv.let { kv -> listOf("fpart.", "fmeta.").all { p -> kv.list(p + bobsAlice.id).isEmpty() } })
+        // Wipe from the other side reaches the app; leaving the mode too.
+        b.node.sendWipe(bobsAlice)
+        waitFor { a.rec.controls.contains(Node.CONTROL_WIPE) }
+        assertTrue(a.rec.controls.contains(Node.CONTROL_WIPE))
+        b.node.setPrivateMode(bobsAlice, false)
+        waitFor { !a.node.isPrivate(c) }
+        assertFalse(a.node.isPrivate(c))
+        assertTrue(a.rec.controls.contains(Node.CONTROL_OFF))
+        // Back to normal: an ordinary message is stored the usual way and not flagged.
+        b.node.sendText(bobsAlice, "plain")
+        waitFor { a.rec.got.contains("plain") }
+        assertFalse(a.rec.msgs.last().isPrivate)
+    }
+
+    @Test
+    fun privateMessagesNeverGoThroughTheMailbox() {
+        val a = Peer("privmaila", mailbox = true); val b = Peer("privmailb", mailbox = true)
+        val bobsAlice = b.node.acceptInvite(a.node.createInvite(), "hi")
+        waitFor { a.node.contacts().singleOrNull()?.supportsPrivate == true && bobsAlice.supportsPrivate && bobsAlice.peerMailbox.isNotEmpty() }
+        val c = a.node.contacts().single()
+        a.stop() // alice is offline; her mailbox exists
+        val ordinary = mailboxStore
+        assertFailsWith<IOException> { b.node.setPrivateMode(bobsAlice, true) }
+        assertFailsWith<IOException> { b.node.sendText(bobsAlice, "secret", flags = Node.FLAG_PRIVATE) }
+        // An ordinary message still falls back to the mailbox.
+        b.node.sendText(bobsAlice, "ordinary")
+        assertTrue(ordinary.list(Codec.hex(MailboxProtocol.queueId(c.myQueueSecret)), 10).size >= 1)
+    }
 }
 
 class RecoveryTest {

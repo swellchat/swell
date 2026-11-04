@@ -1,6 +1,6 @@
 #!/bin/sh
 # Builds the Swell mailbox on the Mac, copies it to the VPS (separate compose project ~/swell-mailbox,
-# 0.5 CPU / 256 MB, no published ports) and (re)starts it. Prints the onion address.
+# no CPU or memory cap, no published ports) and (re)starts it. Prints the onion address.
 set -e
 cd "$(dirname "$0")"
 ( cd ../../android && JAVA_HOME=/opt/homebrew/opt/openjdk@17 ./gradlew :mailbox:installDist -q )

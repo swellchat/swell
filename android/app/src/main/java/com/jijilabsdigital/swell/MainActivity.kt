@@ -10,6 +10,7 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.navigation.compose.NavHost
@@ -47,6 +48,8 @@ class MainActivity : FragmentActivity() {
     override fun onStop() {
         super.onStop()
         Swell.setForeground(false)
+        // Private chats are wiped when the app leaves the screen (not on a rotation).
+        if (!isChangingConfigurations) Swell.wipeAllPrivate()
         stoppedAt = System.currentTimeMillis()
     }
 
@@ -90,7 +93,11 @@ class MainActivity : FragmentActivity() {
         }
         NavHost(nav, startDestination = "chats") {
             composable("chats") {
-                ChatsScreen(onOpen = { id, m -> nav.navigate(if (m != null) "chat/$id?m=$m" else "chat/$id") }, onAdd = { nav.navigate("add") }, onSettings = { nav.navigate("settings") })
+                ChatsScreen(onOpen = { id, m -> nav.navigate(if (m != null) "chat/$id?m=$m" else "chat/$id") }, onAdd = { nav.navigate("add") }, onSettings = { nav.navigate("settings") }, onPhrase = { nav.navigate("phrase") })
+            }
+            composable("phrase") {
+                val words = remember { Swell.account?.phrase ?: emptyList() }
+                com.jijilabsdigital.swell.ui.PhraseScreen(words, onDone = { Swell.phraseSaved = true; nav.popBackStack() })
             }
             composable(
                 "chat/{id}?m={m}",
@@ -148,6 +155,10 @@ class MainActivity : FragmentActivity() {
         intent.getStringExtra("avatar")?.let { name ->
             Swell.work { runCatching { Swell.makeAvatar(android.net.Uri.fromFile(java.io.File(getExternalFilesDir(null), name))) }.onSuccess { Swell.setMyAvatar(it); Log.i("Swell", "AVATAR set ${it.size} B") }.onFailure { Log.i("Swell", "AVATAR failed ${it}") } }
         }
+        intent.getStringExtra("clip")?.let { t ->
+            (getSystemService(CLIPBOARD_SERVICE) as android.content.ClipboardManager).setPrimaryClip(android.content.ClipData.newPlainText("t", t))
+        }
+        if (intent.hasExtra("resetclip")) Swell.db.delete("app", "clipChecked")
         if (intent.hasExtra("newinvite")) Swell.newInvite(fresh = true) { }
         intent.getStringExtra("mailbox")?.let { Swell.mailboxOnion = it; Log.i("Swell", "MAILBOX set") }
         if (intent.hasExtra("verifylast")) Swell.whenOnline { n -> n.contacts().lastOrNull()?.let { n.setVerified(it, true) } }

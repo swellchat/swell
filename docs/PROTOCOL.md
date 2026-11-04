@@ -65,7 +65,7 @@ Every frame starts with `u8 PROTOCOL=2 | u8 type`.
 | 7 FILE_PART | `raw16 fileId, i32 index, bytes data (≤ 240 KiB; ≤ 48 KiB if it may go via mailbox)` |
 | 8 FILE | `MSG, raw16 fileId, str name, str mime, i64 size (≤ 5,000,000), raw32 sha256, i32 parts` |
 
-- **HELLO and STATE trailing field (1.1):** both end with `i32 caps` (HELLO: after `MSG`; STATE: after `authKey`). Bit 0 (`CAP_V11`, value 1) means "I understand inner types 9–13 and the trailing fields of section 5a". A peer that sends no `caps` (1.0) has caps = 0, and a 1.1 node sends it nothing new.
+- **HELLO and STATE trailing field (1.1):** both end with `i32 caps` (HELLO: after `MSG`; STATE: after `authKey`). Bit 0 (`CAP_V11`, value 1) means "I understand inner types 9–13 and the trailing fields of section 5a". A peer that sends no `caps` (1.0) has caps = 0, and a 1.1 node sends it nothing new. Further bits (section 5b): bit 1 `CAP_VIEW_ONCE` (value 2), bit 2 `CAP_PRIVATE_MODE` (value 4), bit 3 `CAP_LINK_PREVIEW` (value 8, section 5c). A node announces the bits it implements (Android 1.2: 15). A sender uses a feature only if the contact announced its bit; a reader ignores bits it does not know.
 - **`MSG` layout:** `raw16 messageId, i64 sentAtMillis, i32 expireSec (ignored by the receiver; the chat timer applies), str text`.
 - **STATE:** sent after HELLO (as the HELLO answer), and whenever name, mailbox, address or key changes.
 - **Receiver rule:** a receiver uses `authKey` as its client-auth key for the sender's `onion`.
@@ -80,9 +80,10 @@ All of these are backwards compatible: a 1.0 reader ignores unknown inner types 
 | 8 FILE (extended) | `MSG, raw16 fileId, str name, str mime, i64 size, raw32 sha256, i32 parts, [bytes replyTo, i32 durationMs]`. Both trailing fields come together (`replyTo` may be empty). `durationMs` is 0 for non-audio and 1..180000 for a voice note. |
 | 9 REACTION | `raw16 messageId, str emoji, u8 add (1 = add or replace, 0 = remove)` |
 | 10 MODIFY | `u8 op (1 = delete for everyone, 2 = edit), raw16 messageId, str text` |
-| 11 RECEIPT | `u8 kind (1 = delivered, 2 = read), i32 n (0..64), raw16 messageId × n` |
+| 11 RECEIPT | `u8 kind (1 = delivered, 2 = read, 3 = opened), i32 n (0..64), raw16 messageId × n` (kind 3: section 5b) |
 | 12 TYPING | `u8 on (1 = typing, 0 = stopped)` |
 | 13 AVATAR | `raw32 sha256, bytes jpeg` (empty `jpeg` = photo removed) |
+| 14 CONTROL | `u8 op (1 = private mode on, 2 = off, 3 = wipe)` (section 5b) |
 
 **Voice notes:** an ordinary FILE (parts via FILE_PART, then FILE) with `mime = "audio/mp4"` (AAC-LC in an MP4/M4A container, mono, about 32 kbps, 16 kHz), at most 180 s, and `durationMs` as the trailing field. Without `durationMs` (sent to a 1.0 contact) the receiver derives the length from the file. The file name is `voice-<unixMillis>.m4a`.
 
@@ -105,8 +106,63 @@ All of these are backwards compatible: a 1.0 reader ignores unknown inner types 
 
 **Invite link (Android 1.1 and iOS):** `https://jijilabsdigital.com/swell/i#<invite code>`; the fragment is the complete invite code (`swell:...`; the prefix may be omitted when reading). The fragment never reaches the web server. Android registers it as an App Link and opens straight to the "Connect?" confirmation.
 
+**Deferred invite (clipboard, Android 1.2):** the web page `https://jijilabsdigital.com/swell/i` (the page behind the invite link) copies the **complete link**, `https://jijilabsdigital.com/swell/i#swell:...`, to the clipboard when the person taps "Get Swell" (before sending them to the store). After install, on the first open and on the Add-contact screen, the app reads the clipboard **only at those two moments**, and if the text matches `^https://jijilabsdigital\.com/swell/i#(swell:)?[A-Za-z0-9_-]+$` it offers "Connect with the person who invited you?". Accepting redeems the code as usual; after use (accept or dismiss) the app clears the clipboard if it still holds that text. Nothing else is read from the clipboard.
+
 **Rate limits:** REACTION, MODIFY, RECEIPT, TYPING and AVATAR from one contact are limited to 90 per minute together (the existing `allowInbound` check with its own bucket); beyond that they are dropped silently (the frame is still answered `R_OK`). The pre-decryption limit per contact is 120 + 90 frames a minute, so these cannot starve texts.
 
+
+## 5b. View once, per-message timer, private mode (Android 1.2; types 14, flags, caps bits 1 and 2)
+
+All of this is backwards compatible in the same way as 5a: a reader ignores unknown trailing bytes after `TEXT` and `FILE`, ignores unknown inner types, and a sender uses a feature only after the contact announced the matching `caps` bit. Where a contact lacks the bit, the sender's app disables the option and says "Update needed".
+
+**Caps bits.** `CAP_V11 = 1`, `CAP_VIEW_ONCE = 2` (view once and the per-message timer), `CAP_PRIVATE_MODE = 4`.
+
+**Trailing fields.**
+
+| Type | Body |
+|------|------|
+| 2 TEXT | `MSG, bytes replyTo, u8 flags, i32 timerSec`. `replyTo` is empty when not a reply. A sender adds `flags` and `timerSec` (together, after `replyTo`) only when `flags != 0` or `timerSec != 0`. |
+| 8 FILE | `MSG, raw16 fileId, str name, str mime, i64 size, raw32 sha256, i32 parts, bytes replyTo, i32 durationMs, u8 flags, i32 timerSec`. The first six trailing fields are as in 5a; `flags` and `timerSec` follow `durationMs` and are added under the same rule. A 1.0 reader refuses trailing bytes on FILE, which is why everything here needs the contact's `CAP_V11` as well. |
+
+- **`flags`** (`u8`): bit 0 = view once; bit 1 = private; bits 2..7 reserved, sent as 0, ignored on receipt.
+- **`timerSec`** (`i32`): 0 = none, otherwise 1..2,592,000 (30 days). Values outside are treated as 0.
+- **View once (bit 0)** is only valid on a FILE whose `mime` starts with `image/` or `video/`. A receiver ignores bit 0 on any other message (it is shown as an ordinary message). The sender sends it only to contacts with `CAP_VIEW_ONCE`.
+
+**View once, receiver.**
+- It shows a blurred placeholder ("View-once photo"), never the content, and never builds a thumbnail, notification preview, gallery copy or backup of it. A notification says only "View-once photo".
+- The viewer is full screen with the platform's screenshot block (Android `FLAG_SECURE`). The user can open it once. When the viewer closes, the app deletes the file and every key for it at once, and sends `RECEIPT kind 3` (opened) for the `messageId`.
+- No-trace rule: the receiver's row disappears 60 s after the viewer closes, with no placeholder left. It is removed from the database, files, caches, the search index and notifications.
+- An item nobody opened expires and is removed after 14 days from receipt.
+
+**View once, sender.** The sender keeps no viewable copy: the picked file is not stored. Its row shows "View-once photo" with the send/delivery status. When `RECEIPT kind 3` arrives, the row disappears 60 s later (no placeholder, purged from everywhere). If it never arrives, the row expires after 14 days.
+
+**RECEIPT kind 3 (opened).** Same layout as kinds 1 and 2 (`u8 kind, i32 n, raw16 messageId × n`). Unlike kinds 1 and 2 it is sent and processed **even when the receipts setting is off**, because the feature cannot work without it (the app tells the person so when they open the photo). It is only acted on for outgoing view-once messages of that contact; for any other `messageId` it is ignored. It may travel through the mailbox.
+
+**Per-message timer (`timerSec > 0`).**
+- Receiver: the timer starts when the message is first shown on screen (chat open, message in view). The message is then deleted `timerSec` seconds later, with no trace (as above). A message never shown is removed after 14 days.
+- Sender: starts the same countdown when the read receipt (`RECEIPT kind 2`, or kind 3 for a view-once message) arrives. If receipts are off (no kind 2 arrives), the sender falls back to the chat's disappearing timer (type 3 SETTINGS), and keeps the message if there is none.
+- The per-chat timer remains the default for messages without `timerSec`. If both apply, the sooner one wins.
+- The composer offers Off / 10 s / 1 min / 1 h / 1 day.
+
+**Private mode (per chat).**
+- `CONTROL` (type 14): `u8 op`. `1` = private mode on, `2` = off, `3` = wipe. Sent only to contacts with `CAP_PRIVATE_MODE`, **direct path only, never the mailbox** (a receiver drops a copy that arrives from the mailbox). Unknown `op` is ignored. The same rate bucket as TYPING applies.
+- A message with `flags` bit 1 is a private message. Private messages are also **direct only**: if the contact is offline the send fails ("Private messages need the other person online") and nothing is queued anywhere.
+- The receiver keeps private messages (text, photos, voice, file parts and the decrypted media) **in RAM only**: never in the database, files, cache, search index, backups, the chat-list preview or a notification. File parts of a contact that is in private mode are also held in RAM until the FILE arrives. The notification text is "New private message", with no sender and no content.
+- Both sides show the banner "Private mode · nothing is saved" and a distinct darker look, and block screenshots while it is on.
+- `op 1` from the contact puts our side in private mode too (the mode is shared by the chat); a private message that arrives while we are not in the mode (we missed op 1, or restarted) turns it on and is kept in RAM.
+- `op 3` or `op 2` from the contact: delete every private message of that chat from RAM (both directions), `op 2` also leaves the mode.
+- A node sends `op 3` (and wipes its own copy) when its user leaves the chat, the app goes to the background, the screen locks, or the chat is idle for 5 minutes (no message sent or received). Turning the mode off sends `op 2`, which also wipes. If the process dies, the messages are simply gone; the mode flag is not stored either.
+- Delivery/read receipts, reactions, edits and replies are not used in private mode.
+
+## 5c. Link previews (Android 1.2; caps bit 3)
+
+`CAP_LINK_PREVIEW = 8`. Off by default on both sides. The **sender** builds the preview (the receiver never fetches anything), so the receiver's address is never exposed to the linked site.
+
+- **Wire:** one more trailing field on `TEXT`, after `timerSec`: `TEXT = MSG, bytes replyTo, u8 flags, i32 timerSec, bytes preview`. A sender that adds `preview` always writes `replyTo`, `flags` and `timerSec` first (zeros if unused). Only sent to contacts with `CAP_LINK_PREVIEW`, and only when the sender turned link previews on.
+- **`preview` layout** (the bytes of): `u8 version (1), str url (≤ 2048 bytes, https only), str title (≤ 200 bytes), str site (≤ 100 bytes, host or site name), bytes thumbJpeg (≤ 24,576 bytes, may be empty; JPEG, longest side ≤ 240 px, EXIF stripped)`.
+- **Receiver:** shows a card (thumbnail, title, site) under the text only if `url` appears in the message text (otherwise the card is dropped), `url` is `https://`, and sizes are within the limits; anything else is ignored and the text shows normally. The card is inside the message, so it follows that message's rules (timer, view once never applies, private mode: previews are not sent in private mode). Tapping the card opens the browser after a "Open this link?" confirmation. The receiver never fetches the page or the image.
+- **Sender fetch:** the sender's app downloads the page (HTML up to 256 KiB, 10 s) and the `og:image` (up to 400 KiB) **over its own Tor SOCKS port**, never directly, then re-encodes the image. If anything fails, the message is sent without a preview.
+- **Receipts for the setting:** the user-facing setting is "Link previews" (Settings › Privacy). It only affects what this phone sends; what arrives is always shown.
 
 ## 6. Mailbox (onion service, port 80)
 
@@ -120,7 +176,7 @@ Frames start with `u8 VERSION=2 | u8 op`. Queue id = `SHA-256("swell-queue" || s
 | 0x13 ACK | `raw32 secret, i32 n, str id × n` | `0x80` |
 | 0x15 CREDS | `i64 minute, i64 nonce`; `SHA-256("swell-cred" ‖ i64 minute ‖ i64 nonce)` has ≥ 18 leading zero bits; minute = now/60000 ± 1; each nonce works once | `u8 0x83, i32 n, str url × n, str username, str password, i64 expiresAtMillis` |
 | 0x16 PEEK | `raw32 queueId` (no secret). Reads, deletes nothing. Used by v3 mailbox invites. At most 600 per minute per server | `u8 0x82, i32 count (0 or 1), (i32 0, str id, bytes envelope)`: the oldest envelope; unknown queue = empty list; over the limit = `0xFF` |
-| 0x17 WAIT | `i32 maxWaitMs` (clamped to 0..25000), `i32 n (1..8), raw32 secret × n`. Long poll | Like GET for those queues (same item layout and index, nothing deleted; ACK as usual), sent as soon as one queue has mail, or empty at the timeout. One waiter per queue (a newer WAIT covering a queue makes the older one answer empty); at most 48 waiters server-wide, beyond that `0xFF` |
+| 0x17 WAIT | `i32 maxWaitMs` (clamped to 0..25000), `i32 n (1..64), raw32 secret × n`. Long poll | Like GET for those queues (same item layout and index, nothing deleted; ACK as usual), sent as soon as one queue has mail, or empty at the timeout. One waiter per queue (a newer WAIT covering a queue makes the older one answer empty); server-wide waiter cap is configurable (default 4,000 on the Jiji Labs mailbox), beyond that `0xFF`. **Compatibility:** mailboxes older than 1.2 accept `n` up to 8 only and answer `0xFF` to more; a client that gets `0xFF` for `n > 8` retries once with its 8 newest queues and keeps using 8 for that session. Items for the first queues come first (`MAX_LIST` 50 items and 192 KiB per answer overall, so a very busy account sees the rest on the next WAIT or an ACK-then-WAIT). |
 
 **Envelope:** a complete peer `MSG` frame (section 4), stored as is.
 
@@ -129,7 +185,7 @@ Frames start with `u8 VERSION=2 | u8 op`. Queue id = `SHA-256("swell-queue" || s
 - TTL: 14 days.
 - A queue nobody fetched for 14 days is deleted.
 
-**Foreground clients (iOS)** keep one stream open to the mailbox and loop WAIT (25 s) on it, using the same stream for PUT/ACK; on `0xFF` for 0x17 (older server) they fall back to polling GET every 12 s. Both ops are new in mailbox 1.1; an old server answers `0xFF` to them.
+**Foreground clients (iOS, Android)** keep one stream open to the mailbox and loop WAIT (25 s) on it, using the same stream for PUT/ACK; on `0xFF` for 0x17 (older server) they fall back to polling GET every 12 s. Both ops are new in mailbox 1.1 (64 queues per WAIT: 1.2); an old server answers `0xFF` to them.
 
 **Client polling rule:** fetch one queue per request, each over its own Tor circuit (SOCKS username = random isolation tag).
 
