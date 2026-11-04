@@ -1,0 +1,15 @@
+DataDirectory /data/tor/data
+# Single-hop onion service (2026-11-04, owner OK): the mailbox's location is not secret (it is our VPS),
+# so the service side skips its 3 anonymity hops. Client anonymity is unchanged; the path is ~4 hops instead of 6.
+# The onion address stays the same (same HiddenServiceDir keys). Requires SocksPort 0 (set below).
+HiddenServiceNonAnonymousMode 1
+HiddenServiceSingleHopMode 1
+HiddenServiceDir /data/tor/hs
+HiddenServicePort 80 127.0.0.1:7070
+# Onion-service DoS protection (Tor 0.4.8+): proof-of-work under load, intro-point rate limits, stream caps.
+HiddenServicePoWDefensesEnabled 1
+HiddenServiceEnableIntroDoSDefense 1
+HiddenServiceMaxStreams 64
+HiddenServiceMaxStreamsCloseCircuit 1
+SocksPort 0
+Log warn stdout

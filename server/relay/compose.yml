@@ -1,0 +1,21 @@
+# Swell call relay (TURN). Separate project;
+# Host network: UDP 3478 + relay ports 40000-40199. No logs of IP addresses.
+name: swell-relay
+services:
+  turn:
+    image: coturn/coturn:4.6
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - ./turnserver.conf:/etc/coturn/turnserver.conf:ro
+      - ./run.sh:/run/swell/run.sh:ro
+      - ./secret:/run/swell/secret:ro
+    entrypoint: ["sh", "/run/swell/run.sh"]
+    cpus: 0.5
+    mem_limit: 128m
+    pids_limit: 64
+    read_only: true
+    tmpfs: [/tmp, /var/lib/coturn]
+    security_opt: [no-new-privileges:true]
+    logging:
+      driver: none
