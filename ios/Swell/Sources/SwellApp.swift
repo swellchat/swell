@@ -14,9 +14,11 @@ struct SwellApp: App {
                 default: OnboardingView()
                 }
             }
+            .privacyCover()
+            .id(model.themeTick)
             .environmentObject(model)
             .tint(Ocean.accent)
-            .preferredColorScheme(Debug.has("-swellLight") ? .light : nil)
+            .preferredColorScheme(Debug.has("-swellLight") ? .light : model.theme.scheme)
             .onChange(of: phase, initial: true) { _, p in model.scene(p) }
             .onAppear { if Debug.has("-swellTrace") { UIApplication.shared.isIdleTimerDisabled = true } }
             .onOpenURL { model.handleLink($0) }

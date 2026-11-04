@@ -1,20 +1,46 @@
 import SwiftUI
 
-/// Swell look: deep navy in dark mode, soft mist in light mode, one sea-teal accent.
-/// Text always uses the system font (Dynamic Type). No pixel art.
+/// Swell's own themes and accents. Settings stores the choice; the whole view tree is rebuilt when it changes.
+enum SwellTheme: String, CaseIterable, Identifiable {
+    case navy, midnight, light, mist, system
+    var id: String { rawValue }
+    var title: String { switch self { case .navy: return "Swell Navy"; case .midnight: return "Midnight"; case .light: return "Swell Light"; case .mist: return "Mist"; case .system: return "Follow system" } }
+    /// nil follows the system.
+    var scheme: ColorScheme? { switch self { case .navy, .midnight: return .dark; case .light, .mist: return .light; case .system: return nil } }
+    static var current: SwellTheme { SwellTheme(rawValue: UserDefaults.standard.string(forKey: "theme") ?? "") ?? .navy }
+}
+
+enum SwellAccent: String, CaseIterable, Identifiable {
+    case wave, teal, indigo, violet, coral, amber
+    var id: String { rawValue }
+    var title: String { switch self { case .wave: return "Swell blue"; case .teal: return "Teal"; case .indigo: return "Indigo"; case .violet: return "Violet"; case .coral: return "Coral"; case .amber: return "Amber" } }
+    /// (gradient start, gradient end), also the solid accent in dark / light.
+    var colors: (UInt32, UInt32) {
+        switch self {
+        case .wave: return (0x2563EB, 0x06B6D4); case .teal: return (0x0F9488, 0x2DD4BF); case .indigo: return (0x4338CA, 0x818CF8)
+        case .violet: return (0x7C3AED, 0xC084FC); case .coral: return (0xE5484D, 0xFF9B7A); case .amber: return (0xD97706, 0xFBBF24)
+        }
+    }
+    var solidDark: UInt32 { self == .wave ? 0x2390DC : colors.1 }
+    var solidLight: UInt32 { self == .wave ? 0x1B72B8 : colors.0 }
+    static var current: SwellAccent { SwellAccent(rawValue: UserDefaults.standard.string(forKey: "accent") ?? "") ?? .wave }
+}
+
+/// Swell look: deep navy by default, soft mist in light themes, one accent. System font everywhere (Dynamic Type). No pixel art.
 enum Ocean {
     private static func dyn(_ light: UInt32, _ dark: UInt32) -> Color {
         Color(UIColor { $0.userInterfaceStyle == .dark ? UIColor(hex: dark) : UIColor(hex: light) })
     }
-    static let accent = dyn(0x1B72B8, 0x2390DC)          // Electric blue
-    static let cyan = Color(red: 0x06/255, green: 0xB6/255, blue: 0xD4/255)
+    private static func hex(_ v: UInt32) -> Color { Color(UIColor(hex: v)) }
+    static var accent: Color { let a = SwellAccent.current; return dyn(a.solidLight, a.solidDark) }
+    static var cyan: Color { hex(SwellAccent.current.colors.1) }
     static let foam = Color(red: 0xB7/255, green: 0xE1/255, blue: 0xF2/255)
-    static let bubble = LinearGradient(colors: [Color(red: 0x25/255, green: 0x63/255, blue: 0xEB/255), cyan], startPoint: .topLeading, endPoint: .bottomTrailing)
+    static var bubble: LinearGradient { let c = SwellAccent.current.colors; return LinearGradient(colors: [hex(c.0), hex(c.1)], startPoint: .topLeading, endPoint: .bottomTrailing) }
     static let onAccent = Color.white
-    static let background = dyn(0xF2F6FA, 0x0A0B22)      // Deep
-    static let card = dyn(0xFFFFFF, 0x1B2152)     // Raised
-    static let incoming = dyn(0xE6ECF3, 0x121231)   // Navy
-    static let hairline = dyn(0xD5DDE8, 0x2A3358)
+    static var background: Color { switch SwellTheme.current { case .midnight: return dyn(0xF2F6FA, 0x000000); case .mist: return hex(0xE9EEF3); case .light: return hex(0xF7F9FC); default: return dyn(0xF2F6FA, 0x0A0B22) } }
+    static var card: Color { switch SwellTheme.current { case .midnight: return dyn(0xFFFFFF, 0x14161B); case .mist: return hex(0xF8FAFC); case .light: return hex(0xFFFFFF); default: return dyn(0xFFFFFF, 0x1B2152) } }
+    static var incoming: Color { switch SwellTheme.current { case .midnight: return dyn(0xE6ECF3, 0x0E1014); case .mist: return hex(0xDAE3EC); case .light: return hex(0xE6ECF3); default: return dyn(0xE6ECF3, 0x121231) } }
+    static var hairline: Color { switch SwellTheme.current { case .midnight: return dyn(0xD5DDE8, 0x23262D); case .mist: return hex(0xC5D0DC); case .light: return hex(0xD5DDE8); default: return dyn(0xD5DDE8, 0x2A3358) } }
 }
 
 private extension UIColor {

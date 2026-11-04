@@ -68,6 +68,16 @@ struct TorAuth: OnionAuth {
     @Published var myPhoto: Data?
     /// A tapped invite link waiting for the user's confirmation.
     @Published var pendingInvite: InviteCode?
+    @Published var theme = SwellTheme.current { didSet { UserDefaults.standard.set(theme.rawValue, forKey: "theme"); themeTick += 1 } }
+    @Published var accent = SwellAccent.current { didSet { UserDefaults.standard.set(accent.rawValue, forKey: "accent"); themeTick += 1 } }
+    @Published var themeTick = 0
+    @Published var appLock = UserDefaults.standard.bool(forKey: "applock") { didSet { UserDefaults.standard.set(appLock, forKey: "applock") } }
+    @Published var screenSecurity = UserDefaults.standard.object(forKey: "screensec") as? Bool ?? true { didSet { UserDefaults.standard.set(screenSecurity, forKey: "screensec") } }
+    @Published var autoplay = UserDefaults.standard.object(forKey: "autoplay") as? Bool ?? true { didSet { UserDefaults.standard.set(autoplay, forKey: "autoplay") } }
+    @Published var phraseHidden = UserDefaults.standard.bool(forKey: "phraseHidden") { didSet { UserDefaults.standard.set(phraseHidden, forKey: "phraseHidden") } }
+    /// Chat-list flags (1 pinned, 2 archived, 4 marked unread), kept on this phone only.
+    @Published var flags: [String: UInt8] = [:]
+    func setFlag(_ id: String, _ f: UInt8, _ on: Bool) { Task { try? await eng()?.setChatFlag(id, f, on); await reload() } }
     @Published var receipts = UserDefaults.standard.bool(forKey: "receipts") {
         didSet { UserDefaults.standard.set(receipts, forKey: "receipts"); let on = receipts; Task { await eng()?.setReceipts(on) } }
     }
@@ -97,6 +107,7 @@ struct TorAuth: OnionAuth {
         start()
         #if DEBUG
         if CommandLine.arguments.contains("-swellWelcome") { stage = .welcome }
+        if let i = CommandLine.arguments.firstIndex(of: "-swellTheme"), i + 1 < CommandLine.arguments.count { UserDefaults.standard.set(CommandLine.arguments[i + 1], forKey: "theme"); theme = SwellTheme.current }
         #endif
     }
 
@@ -305,7 +316,7 @@ struct TorAuth: OnionAuth {
             return false
         }
         store = nil; engine = nil; opening = nil; snapshotKey = nil
-        UserDefaults.standard.removeObject(forKey: "name")
+        UserDefaults.standard.removeObject(forKey: "name"); for k in ["phraseHidden", "applock", "theme", "accent"] { UserDefaults.standard.removeObject(forKey: k) }
         account = nil; contacts = []; messages = []; name = ""; openChat = nil; problem = nil
         stage = .welcome
         return true
@@ -323,6 +334,7 @@ struct TorAuth: OnionAuth {
         #endif
         guard let engine = await eng() else { return }
         contacts = await engine.contacts()
+        flags = await engine.chatFlags()
         #if DEBUG
         await debugDump(engine)
         #endif
@@ -337,7 +349,18 @@ struct TorAuth: OnionAuth {
     func open(_ id: String) {
         openChat = id
         #if DEBUG
-        if CommandLine.arguments.contains("-swellDemo") { messages = DemoData.messages(id); return }
+        if CommandLine.arguments.contains("-swellDemo") {
+            messages = DemoData.messages(id)
+            if let u = fileURL("bb"), !FileManager.default.fileExists(atPath: u.path) { // a drawn sea scene stands in for a photo
+                let r = UIGraphicsImageRenderer(size: CGSize(width: 800, height: 600)).image { c in
+                    let g = CGGradient(colorsSpace: nil, colors: [UIColor(red: 0.98, green: 0.72, blue: 0.45, alpha: 1).cgColor, UIColor(red: 0.2, green: 0.45, blue: 0.75, alpha: 1).cgColor] as CFArray, locations: [0, 0.55])!
+                    c.cgContext.drawLinearGradient(g, start: .zero, end: CGPoint(x: 0, y: 600), options: [])
+                    UIColor(red: 0.05, green: 0.2, blue: 0.4, alpha: 1).setFill(); c.fill(CGRect(x: 0, y: 330, width: 800, height: 270))
+                }
+                try? r.jpegData(compressionQuality: 0.85)?.write(to: u)
+            }
+            return
+        }
         #endif
         messagesLoaded = false
         Task { let e = await eng(); await e?.setOpenChat(id); messages = await e?.messages(id) ?? []; messagesLoaded = true; await reload() }
@@ -541,6 +564,24 @@ struct TorAuth: OnionAuth {
         }
     }
 
+    /// Countries of the relays on the current route, for Settings > Network.
+    func route() async -> [String]? { await tor.route() }
+
+    func mailboxView() async -> [(queue: String, envelopes: Int, bytes: Int)] { await eng()?.mailboxView() ?? [] }
+
+    /// A support report with no message content, names, contacts, keys or addresses: only the app version and counts.
+    func exportDebugLog() -> URL? {
+        let v = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?"
+        let b = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "?"
+        var t = "Swell debug report\nversion \(v) (\(b))\niOS \(UIDevice.current.systemVersion), \(UIDevice.current.model)\n"
+        t += "contacts \(contacts.count), blocked \(contacts.filter { $0.blocked }.count), verified \(contacts.filter { $0.verified }.count)\n"
+        t += "chats with a ready queue \(contacts.filter { $0.queueReady }.count)\nreceipts \(receipts), typing \(typing), lock \(appLock), screen security \(screenSecurity)\n"
+        t += "network \(networkOK ? "connected" : "not connected")\n"
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("swell-debug-log.txt")
+        try? t.write(to: url, atomically: true, encoding: .utf8)
+        return url
+    }
+
     #if DEBUG
     private var lastDump = ""
     /// Console trace for device tests: the newest messages of the first chat, so a script can check what arrived.
@@ -549,7 +590,7 @@ struct TorAuth: OnionAuth {
         let ms = await engine.messages(c.id).suffix(8)
         var out = "SWELL chat caps=\(c.caps) waiting=\(c.waiting) name=\(c.displayName) exp=\(c.expireSec) avatar=\(avatars[c.id]?.count ?? 0)\n"
         for m in ms {
-            out += "SWELL  \(m.incoming ? "<" : ">") id=\(m.id.prefix(6)) st=\(m.status.rawValue) dlv=\(m.delivered ? 1 : 0) rd=\(m.read ? 1 : 0) ed=\(m.edited ? 1 : 0) del=\(m.deleted ? 1 : 0) rx=\(m.myReaction)/\(m.theirReaction) re=\(m.replyTo.prefix(6)) v=\(m.voiceMs)\(m.fileId.isEmpty ? "" : "f:\(m.fileMime):\(m.fileSize)") \(m.text)\n"
+            out += "SWELL  \(m.incoming ? "<" : ">") id=\(m.id.prefix(6)) st=\(m.status.rawValue) dlv=\(m.delivered ? 1 : 0) rd=\(m.read ? 1 : 0) ed=\(m.edited ? 1 : 0) del=\(m.deleted ? 1 : 0) rx=\(m.myReaction)/\(m.theirReaction) re=\(m.replyTo.prefix(6)) ra=\(m.receivedAt) v=\(m.voiceMs)\(m.fileId.isEmpty ? "" : "f:\(m.fileMime):\(m.fileSize)") \(m.text)\n"
         }
         if out != lastDump { lastDump = out; fputs(out, stderr) }
     }
@@ -587,7 +628,7 @@ struct TorAuth: OnionAuth {
             fputs("SWELL file \(d.count) bytes sent in \(Date().timeIntervalSince(t1))s\n", stderr)
         }
         if a.contains("-swellAutoNote") { _ = try? await engine.send("note test", to: Engine.noteId) }
-        if a.contains("-swellAutoCode") { let t = Date(); let r = await myCode(); fputs("SWELL code in \(String(format: "%.4f", Date().timeIntervalSince(t)))s -> \(r.code.map { String($0.prefix(12)) } ?? r.error ?? "?")\n", stderr) }
+        if a.contains("-swellAutoCode") { let t = Date(); let r = await myCode(); fputs("SWELL code in \(String(format: "%.4f", Date().timeIntervalSince(t)))s -> \(r.code ?? "" ?? r.error ?? "?")\n", stderr) }
         await reload()
     }
     #endif

@@ -172,4 +172,29 @@ actor TorService {
             }
         }
     }
+
+    /// The newest finished circuit that ends at an onion service: the country of each relay on the way, entry first
+    /// (nil when Tor is not ready or reports nothing). Read from Tor's control port; nothing is sent anywhere.
+    func route() async -> [String]? {
+        guard let controller, status == .ready else { return nil }
+        func info(_ key: String) async -> String {
+            await withCheckedContinuation { (k: CheckedContinuation<String, Never>) in
+                controller.getInfoForKeys([key]) { k.resume(returning: $0.first ?? "") }
+            }
+        }
+        let lines = (await info("circuit-status")).split(separator: "\n").map(String.init)
+        // "<id> BUILT $FP~nick,$FP~nick,... PURPOSE=HS_CLIENT_REND ..." : prefer an onion-service circuit, else any built one.
+        let built = lines.filter { $0.contains(" BUILT ") }
+        guard let line = built.last(where: { $0.contains("HS_CLIENT") }) ?? built.last,
+              let path = line.split(separator: " ").dropFirst(2).first else { return nil }
+        var out: [String] = []
+        for hop in path.split(separator: ",") {
+            let fp = hop.split(separator: "~").first.map { String($0).trimmingCharacters(in: CharacterSet(charactersIn: "$")) } ?? ""
+            let ns = await info("ns/id/\(fp)")
+            let ip = ns.split(separator: "\n").first(where: { $0.hasPrefix("r ") })?.split(separator: " ").dropFirst(5).first.map(String.init) ?? ""
+            let cc = ip.isEmpty ? "" : (await info("ip-to-country/\(ip)")).uppercased()
+            out.append(cc.isEmpty || cc == "??" ? "" : cc)
+        }
+        return out
+    }
 }

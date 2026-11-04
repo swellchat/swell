@@ -1,5 +1,7 @@
 package com.jijilabsdigital.swell.mailbox
 
+import com.jijilabsdigital.swell.core.Bell
+import com.jijilabsdigital.swell.core.BellLog
 import com.jijilabsdigital.swell.core.FileMailboxStore
 import com.jijilabsdigital.swell.core.ScaledInboundServer
 import com.jijilabsdigital.swell.core.MailboxProtocol
@@ -24,7 +26,9 @@ fun threadFactory(): ThreadFactory = runCatching {
  * Env: MAILBOX_DIR (default /data/queues), MAILBOX_PORT (default 7070),
  * TURN_SECRET_FILE (default /data/turn-secret, shared with the coturn relay), TURN_URLS (comma separated),
  * MAILBOX_MAX_CONNECTIONS (default 6000), MAILBOX_MAX_WAITS (default 4000), MAILBOX_BACKLOG (default 1024).
- * Logs only counts, never queue ids.
+ * Swell Bell: MAILBOX_BELL=off disables it; MAILBOX_BELL_DIR (default: "bell" next to MAILBOX_DIR, never inside it),
+ * MAILBOX_BELL_MAX_MB (default 192, about 16.7 million tags), MAILBOX_MAX_BELLS (parked listeners, default 5000).
+ * Logs only counts, never queue ids or cursors.
  */
 fun main() {
     val dir = File(System.getenv("MAILBOX_DIR") ?: "/data/queues")
@@ -36,11 +40,17 @@ fun main() {
     val secret = File(System.getenv("TURN_SECRET_FILE") ?: "/data/turn-secret").takeIf { it.canRead() }?.readText()?.trim()
     val urls = (System.getenv("TURN_URLS") ?: "turn:203.0.113.10:3478?transport=udp").split(',').map { it.trim() }.filter { it.isNotEmpty() }
     val turn = secret?.takeIf { it.isNotEmpty() }?.let { TurnConfig(it.toByteArray(), urls) }
-    val server = MailboxServer(store, turn = turn, maxWaits = maxWaits)
+    val bell = if (System.getenv("MAILBOX_BELL") == "off") null else BellLog(
+        dir = System.getenv("MAILBOX_BELL_DIR")?.let { File(it) } ?: File(dir.absoluteFile.parentFile, "bell"),
+        maxBytes = (System.getenv("MAILBOX_BELL_MAX_MB") ?: "192").toLong() * 1024 * 1024,
+        maxListeners = (System.getenv("MAILBOX_MAX_BELLS") ?: Bell.DEFAULT_MAX_LISTENERS.toString()).toInt(),
+    )
+    bell?.let { b -> Runtime.getRuntime().addShutdownHook(Thread { b.close() }) }
+    val server = MailboxServer(store, turn = turn, maxWaits = maxWaits, bell = bell)
     val factory = threadFactory()
     ScaledInboundServer(port, server::handle, maxConnections, factory, backlog).start()
     println("swell-mailbox listening on 127.0.0.1:$port, dir=$dir, call relay credentials ${if (turn != null) "on" else "off"}, " +
-        "connections<=$maxConnections waits<=$maxWaits threads=${if (Thread.currentThread().javaClass.name.contains("Virtual") || factory.newThread {}.isVirtual()) "virtual" else "platform"}")
+        "connections<=$maxConnections waits<=$maxWaits bell=${if (bell != null) "on" else "off"} threads=${if (Thread.currentThread().javaClass.name.contains("Virtual") || factory.newThread {}.isVirtual()) "virtual" else "platform"}")
     thread(name = "purge", isDaemon = false) {
         while (true) {
             runCatching { store.purge(System.currentTimeMillis() - MailboxProtocol.TTL_MS) }

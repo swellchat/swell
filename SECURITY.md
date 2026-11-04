@@ -1,6 +1,6 @@
 # Security Policy
 
-Swell is in design stage and has not been independently audited.
+Swell has had an internal security review and has not been independently audited.
 
 ## Reporting a vulnerability
 

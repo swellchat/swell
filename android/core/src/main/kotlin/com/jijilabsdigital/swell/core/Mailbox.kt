@@ -28,6 +28,9 @@ object MailboxProtocol {
     const val PEEK = 0x16
     /** Long poll: answers like GET for up to 64 queues as soon as one has mail, or empty after the wait (iOS foreground). */
     const val WAIT = 0x17
+    /** Swell Bell: read the public tag log without naming a queue (PROTOCOL.md 6a). */
+    const val BELL = 0x18
+    const val R_BELL = 0x84
     const val R_OK = 0x80
     const val R_LIST = 0x82
     const val R_CREDS = 0x83
@@ -211,6 +214,278 @@ class FileMailboxStore(
     }
 }
 
+/** Swell Bell helpers shared by clients and the server (PROTOCOL.md 6a). */
+object Bell {
+    /** Caps bit 16. */
+    const val CAP_BELL = 1 shl 16
+    /** Inner message type 15: `raw32 key`. */
+    const val INNER_BELLKEY = 15
+    const val TAG_SIZE = 12
+    const val KEY_SIZE = 32
+    /** Most tags in one BELL answer. */
+    const val MAX_TAGS_PER_REPLY = 2048
+    /** Tags are published to listeners at most this often (trailing edge). */
+    const val COALESCE_MS = 100L
+    const val RETENTION_MS = 14L * 86400 * 1000
+    /** 192 MiB of disk = about 16.7 million tags (12 bytes each). */
+    const val DEFAULT_MAX_BYTES = 192L * 1024 * 1024
+    /** Parked BELL requests the server holds at once (each is one connection). */
+    const val DEFAULT_MAX_LISTENERS = 5_000
+
+    fun newKey(): ByteArray = Codec.random(KEY_SIZE)
+
+    private fun mac(key: ByteArray, nonce: ByteArray): ByteArray {
+        val m = javax.crypto.Mac.getInstance("HmacSHA256")
+        m.init(javax.crypto.spec.SecretKeySpec(key, "HmacSHA256"))
+        return m.doFinal(nonce)
+    }
+
+    /** `nonce(4) || HMAC-SHA256(key, nonce)[0..8]`. */
+    fun tag(key: ByteArray, nonce: ByteArray = Codec.random(4)): ByteArray {
+        require(key.size == KEY_SIZE && nonce.size == 4)
+        return nonce + mac(key, nonce).copyOf(8)
+    }
+
+    /** True if [tag] was made with [key] (constant-time compare). */
+    fun matches(key: ByteArray, tag: ByteArray): Boolean {
+        if (tag.size != TAG_SIZE || key.size != KEY_SIZE) return false
+        return java.security.MessageDigest.isEqual(mac(key, tag.copyOf(4)).copyOf(8), tag.copyOfRange(4, 12))
+    }
+
+    /** Indices of the keys that match [tag]. */
+    fun matching(keys: List<ByteArray>, tag: ByteArray): List<Int> = keys.indices.filter { matches(keys[it], tag) }
+}
+
+/**
+ * The public tag log behind op BELL. Tags have no queue id and no time; a cursor is the number of the next tag.
+ *
+ * - [append] only touches memory (a ring of the newest tags) under a short lock; a writer thread copies the ring to
+ *   segment files (`bell-<first cursor, 16 hex>.seg`, 12 bytes per tag), so disk speed never delays a PUT or a WAIT.
+ * - Listeners are parked on one [java.util.concurrent.locks.Condition] (no `synchronized`/`wait`, so virtual threads do
+ *   not pin their carrier). A publisher timer moves the visible end of the log at most every [coalesceMs] and wakes all.
+ *   Answers end at publish points, so every listener with the same cursor gets the same bytes.
+ * - Nothing here records who listens: no per-listener state beyond one parked call.
+ * - Pass `dir = null` for memory only (tests).
+ */
+class BellLog(
+    private val dir: File? = null,
+    private val maxBytes: Long = Bell.DEFAULT_MAX_BYTES,
+    private val retentionMs: Long = Bell.RETENTION_MS,
+    private val coalesceMs: Long = Bell.COALESCE_MS,
+    private val maxListeners: Int = Bell.DEFAULT_MAX_LISTENERS,
+    private val ringSize: Int = 262_144,
+    private val segmentEntries: Int = 262_144,
+    private val now: () -> Long = System::currentTimeMillis,
+) : AutoCloseable {
+    private val T = Bell.TAG_SIZE
+    private val lock = java.util.concurrent.locks.ReentrantLock()
+    private val published = lock.newCondition()
+    private val dirty = lock.newCondition()
+    private val ring = ByteArray(ringSize * T)
+    private var appended = 0L      // next cursor to assign; guarded by [lock]
+    private var visible = 0L       // listeners see tags below this; guarded by [lock]
+    private var written = 0L       // next cursor the writer will write; guarded by [lock]
+    private var listeners = 0      // parked BELL calls; guarded by [lock]
+    private var publishScheduled = false
+    private var closed = false
+    private var cacheAt = -1L
+    private val cache = HashMap<Long, ByteArray>() // cursor -> answer, valid while visible == cacheAt
+    /** cursor of the first tag -> file; guarded by [lock]. */
+    private val segments = java.util.TreeMap<Long, File>()
+    private var segStart = -1L       // writer's open segment (first cursor); writer thread only
+    private var segOut: java.io.FileOutputStream? = null
+    private var segCount = 0
+    private val timer = java.util.concurrent.Executors.newSingleThreadScheduledExecutor { r -> Thread(r, "bell-publish").apply { isDaemon = true } }
+    private var writer: Thread? = null
+    private var ringFloor = 0L // lowest cursor in the ring that is valid after a restart; guarded by [lock]
+
+    init {
+        if (dir != null) {
+            dir.mkdirs()
+            dir.listFiles { f -> f.name.matches(Regex("bell-[0-9a-f]{16}\\.seg")) }.orEmpty().sortedBy { it.name }.forEach {
+                segments[it.name.substring(5, 21).toLong(16)] = it
+            }
+            segments.lastEntry()?.let { (start, f) ->
+                val whole = f.length() / T * T
+                if (whole != f.length()) java.io.RandomAccessFile(f, "rw").use { r -> r.setLength(whole) }
+                appended = start + whole / T
+                // Fill the ring with the newest tags so a restart keeps serving recent cursors from memory.
+                val from = maxOf(segments.firstKey(), appended - ringSize)
+                val b = readDisk(from, (appended - from).toInt())
+                if (b != null) for (i in 0 until (appended - from).toInt()) System.arraycopy(b, i * T, ring, (((from + i) % ringSize).toInt()) * T, T)
+                ringFloor = from
+            }
+            visible = appended; written = appended
+            writer = Thread(::writeLoop, "bell-writer").apply { isDaemon = true; start() }
+            timer.scheduleWithFixedDelay({ runCatching { trim() } }, 5, 60, java.util.concurrent.TimeUnit.SECONDS)
+        }
+    }
+
+    /** The visible end of the log (for tests and monitoring). */
+    fun end(): Long { lock.lock(); try { return visible } finally { lock.unlock() } }
+    fun parked(): Int { lock.lock(); try { return listeners } finally { lock.unlock() } }
+    /** Oldest cursor still served. */
+    fun oldest(): Long { lock.lock(); try { return oldestLocked() } finally { lock.unlock() } }
+    fun diskBytes(): Long { lock.lock(); try { return segments.values.sumOf { it.length() } } finally { lock.unlock() } }
+
+    private fun oldestLocked(): Long =
+        if (dir != null) (segments.firstEntry()?.key ?: appended) else maxOf(0L, appended - ringSize)
+
+    /** Adds a tag after its envelope was stored. Memory only; never blocks on disk. */
+    fun append(tag: ByteArray) {
+        require(tag.size == T)
+        lock.lock()
+        try {
+            if (closed) return
+            System.arraycopy(tag, 0, ring, (appended % ringSize).toInt() * T, T)
+            appended++
+            if (coalesceMs <= 0) publishLocked()
+            else if (!publishScheduled) { publishScheduled = true; timer.schedule({ publish() }, coalesceMs, java.util.concurrent.TimeUnit.MILLISECONDS) }
+            if (dir != null) dirty.signal()
+        } finally { lock.unlock() }
+    }
+
+    private fun publish() { lock.lock(); try { publishLocked() } finally { lock.unlock() } }
+    private fun publishLocked() { publishScheduled = false; visible = appended; published.signalAll() }
+
+    /**
+     * One BELL request. Returns the full answer frame, or null if the listener cap is reached (the caller rejects).
+     * Parks up to [maxWaitMs] (0..25000) when [cursor] is at the end of the log.
+     */
+    fun listen(cursor: Long, maxWaitMs: Int): ByteArray? {
+        if (cursor < -1) return null
+        val deadline = System.nanoTime() + maxWaitMs.coerceIn(0, MailboxProtocol.MAX_WAIT_MS) * 1_000_000L
+        lock.lock()
+        var counted = false
+        try {
+            while (true) {
+                if (cursor == -1L) return answer(visible, false, 0, ByteArray(0))
+                if (cursor > visible) return answer(visible, true, 0, ByteArray(0)) // newer than the log: the log was lost
+                if (cursor < visible) break
+                val left = deadline - System.nanoTime()
+                if (left <= 0 || closed) return answer(visible, false, 0, ByteArray(0))
+                if (!counted) { if (listeners >= maxListeners) return null; listeners++; counted = true }
+                try { published.awaitNanos(left) } catch (e: InterruptedException) { return answer(visible, false, 0, ByteArray(0)) }
+            }
+            // cursor < visible: serve from memory or disk.
+            if (counted) { listeners--; counted = false }
+            val end = visible
+            if (cursor < oldestLocked()) return answer(end, true, 0, ByteArray(0))
+            val n = minOf(end - cursor, Bell.MAX_TAGS_PER_REPLY.toLong()).toInt()
+            if (end - cursor <= ringSize && cursor >= maxOf(appended - ringSize, ringFloor)) {
+                if (cacheAt != end) { cache.clear(); cacheAt = end }
+                return cache.getOrPut(cursor) { answer(cursor + n, false, n, copyRing(cursor, n)) }
+            }
+            val diskN = (written - cursor).coerceIn(0, n.toLong()).toInt() // what the writer has already put in files
+            lock.unlock()
+            try {
+                val head = if (diskN > 0) readDisk(cursor, diskN) ?: return answer(end, true, 0, ByteArray(0)) else ByteArray(0)
+                lock.lock()
+                try {
+                    // The rest is still in the ring (the writer never falls more than a ring behind).
+                    if (diskN < n && cursor + diskN < appended - ringSize) return answer(end, true, 0, ByteArray(0))
+                    return answer(cursor + n, false, n, head + copyRing(cursor + diskN, n - diskN))
+                } finally { lock.unlock() }
+            } finally { lock.lock() }
+        } finally {
+            if (counted) listeners--
+            lock.unlock()
+        }
+    }
+
+    private fun copyRing(cursor: Long, n: Int): ByteArray {
+        val out = ByteArray(n * T)
+        for (i in 0 until n) System.arraycopy(ring, ((cursor + i) % ringSize).toInt() * T, out, i * T, T)
+        return out
+    }
+
+    private fun answer(newCursor: Long, lost: Boolean, n: Int, tags: ByteArray): ByteArray =
+        Out().u8(MailboxProtocol.R_BELL).i64(newCursor).u8(if (lost) 1 else 0).i32(n).raw(tags).done()
+
+    /** Reads [n] tags from the segment files; null if they are gone. Takes no lock for the file I/O. */
+    private fun readDisk(cursor: Long, n: Int): ByteArray? {
+        val out = ByteArray(n * T)
+        var got = 0
+        var c = cursor
+        while (got < n) {
+            val e = lock.let { it.lock(); try { segments.floorEntry(c) } finally { it.unlock() } } ?: return null
+            val off = (c - e.key) * T
+            try {
+                java.io.RandomAccessFile(e.value, "r").use { r ->
+                    val avail = ((r.length() - off) / T).toInt()
+                    if (avail <= 0) return null
+                    val take = minOf(avail, n - got)
+                    r.seek(off); r.readFully(out, got * T, take * T)
+                    got += take; c += take
+                }
+            } catch (ex: IOException) { return null }
+        }
+        return out
+    }
+
+    // ---------------------------------------------------------------- disk writer
+
+    private fun writeLoop() {
+        while (true) {
+            var from: Long; var n: Int; var buf: ByteArray
+            lock.lock()
+            try {
+                while (written >= appended && !closed) dirty.awaitNanos(1_000_000_000L)
+                if (written >= appended && closed) break
+                if (appended - written > ringSize) { written = appended - ringSize; segStart = -1 } // fell too far behind: leave a gap, never write wrong cursors
+                from = written; n = minOf((appended - written).toInt(), 4096)
+                buf = copyRing(from, n)
+            } finally { lock.unlock() }
+            try { writeBatch(from, n, buf) } catch (e: IOException) { /* disk trouble: the memory log keeps working */ }
+            lock.lock(); try { written = from + n } finally { lock.unlock() }
+        }
+        runCatching { segOut?.fd?.sync(); segOut?.close() }
+    }
+
+    private fun writeBatch(from: Long, n: Int, buf: ByteArray) {
+        var done = 0
+        while (done < n) {
+            if (segOut == null || segStart < 0 || segCount >= segmentEntries) {
+                runCatching { segOut?.fd?.sync(); segOut?.close() }
+                // Continue the last segment after a restart if it has room, else start a new file at this cursor.
+                val last = lock.let { it.lock(); try { segments.lastEntry() } finally { it.unlock() } }
+                val cont = last != null && segStart < 0 && last.key + last.value.length() / T == from && last.value.length() / T < segmentEntries
+                if (cont) { segStart = last!!.key; segCount = (last.value.length() / T).toInt(); segOut = java.io.FileOutputStream(last.value, true) }
+                else {
+                    val f = File(dir, "bell-%016x.seg".format(from + done))
+                    segStart = from + done; segCount = 0; segOut = java.io.FileOutputStream(f, true)
+                    lock.lock(); try { segments[segStart] = f } finally { lock.unlock() }
+                }
+            }
+            val take = minOf(n - done, segmentEntries - segCount)
+            segOut!!.write(buf, done * T, take * T)
+            segCount += take; done += take
+        }
+    }
+
+    /** Drops whole old segments by age and by total size; the open segment stays. */
+    fun trim() {
+        lock.lock()
+        try {
+            val open = segStart
+            val cut = now() - retentionMs
+            var total = segments.values.sumOf { it.length() }
+            val it = segments.entries.iterator()
+            while (it.hasNext()) {
+                val (start, f) = it.next()
+                if (start == open || segments.size <= 1) break
+                if (f.lastModified() < cut || total > maxBytes) { total -= f.length(); f.delete(); it.remove() } else break
+            }
+        } finally { lock.unlock() }
+    }
+
+    override fun close() {
+        lock.lock(); try { closed = true; dirty.signalAll(); published.signalAll() } finally { lock.unlock() }
+        writer?.join(5_000)
+        timer.shutdownNow()
+    }
+}
+
 /**
  * TURN relay that trusts credentials made with a shared secret (coturn `use-auth-secret`):
  * username = "<expiry unix seconds>:<random>", password = base64(HMAC-SHA1(secret, username)).
@@ -226,6 +501,8 @@ class MailboxServer(
     private val credPowBits: Int = MailboxProtocol.CRED_POW_BITS,
     /** Most parked WAIT requests at once (each costs one connection thread; use virtual threads for thousands). */
     private val maxWaits: Int = MailboxProtocol.MAX_WAITS,
+    /** The Swell Bell tag log; null = this mailbox does not offer Bell (op 0x18 and tagged PUTs get `0xFF`, like a pre-1.3 server). */
+    private val bell: BellLog? = null,
 ) {
     private val usedCredNonces = ConcurrentHashMap<Long, Long>() // nonce -> minute
     private var credMinute = 0L
@@ -327,8 +604,15 @@ class MailboxServer(
             MailboxProtocol.PUT -> {
                 val queue = Codec.hex(r.raw(32))
                 val env = r.bytes(MailboxProtocol.MAX_ENVELOPE)
+                // Optional trailing bell tag: exactly 12 bytes, else the whole frame is refused and nothing is stored.
+                val tag = if (r.more()) r.bytes(Bell.TAG_SIZE + 1).also { if (it.size != Bell.TAG_SIZE || bell == null) throw IOException("bell tag") } else null
                 r.end()
-                if (store.put(queue, env)) { wake(queue); ok() } else reject()
+                if (store.put(queue, env)) { wake(queue); if (tag != null) bell!!.append(tag); ok() } else reject()
+            }
+            MailboxProtocol.BELL -> {
+                val cursor = r.i64(); val ms = r.i32()
+                r.end()
+                bell?.listen(cursor, ms) ?: reject()
             }
             MailboxProtocol.GET -> {
                 val n = r.i32()

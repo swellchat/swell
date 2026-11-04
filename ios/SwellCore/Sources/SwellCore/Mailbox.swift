@@ -154,6 +154,10 @@ public protocol MailboxTransport {
     func warmUp(onion: String, lane: String) async
     /// Closes every long-lived stream (app goes to the background).
     func dropWarm() async
+    /// Hands the already-open stream of `spare` to `lane` (the spare pool). False when `spare` is not open.
+    func adopt(onion: String, spare: String, as lane: String) async -> Bool
+    /// Closes one long-lived stream.
+    func closeLane(onion: String, lane: String) async
 }
 
 public extension MailboxTransport {
@@ -162,6 +166,8 @@ public extension MailboxTransport {
     }
     func warmUp(onion: String, lane: String) async {}
     func dropWarm() async {}
+    func adopt(onion: String, spare: String, as lane: String) async -> Bool { false }
+    func closeLane(onion: String, lane: String) async {}
 }
 
 /// Mailbox client operations on top of a transport.

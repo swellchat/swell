@@ -32,7 +32,25 @@ enum PhotoPrep {
         // No metadata dictionary is passed: the output carries no EXIF, GPS or maker notes. Orientation is already in the pixels.
         CGImageDestinationAddImage(dest, cg, [kCGImageDestinationLossyCompressionQuality: quality] as CFDictionary)
         guard CGImageDestinationFinalize(dest) else { return nil }
-        return out as Data
+        return stripMetadata(out as Data)
+    }
+
+    /// ImageIO still writes a small Exif block (pixel size, colour space) and an empty Photoshop block. Drop every APP1..APP15
+    /// segment so the file carries no metadata at all; JFIF (APP0) and the image data stay.
+    static func stripMetadata(_ d: Data) -> Data {
+        let b = [UInt8](d)
+        guard b.count > 4, b[0] == 0xFF, b[1] == 0xD8 else { return d }
+        var out: [UInt8] = [0xFF, 0xD8]; var i = 2
+        while i + 4 <= b.count, b[i] == 0xFF {
+            let m = b[i + 1]
+            if m == 0xDA { break }
+            let len = Int(b[i + 2]) << 8 | Int(b[i + 3])
+            guard len >= 2, i + 2 + len <= b.count else { return d }
+            if !(m >= 0xE1 && m <= 0xEF) { out += b[i..<(i + 2 + len)] }
+            i += 2 + len
+        }
+        out += b[i...]
+        return Data(out)
     }
 
     /// From the camera.

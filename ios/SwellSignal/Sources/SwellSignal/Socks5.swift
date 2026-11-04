@@ -198,6 +198,8 @@ public struct SocksTransport: MailboxTransport {
     private final class LaneTable: @unchecked Sendable {
         private let m = NSLock(); private var t: [String: WarmLane] = [:]
         func lane(_ key: String) -> WarmLane { m.withLock { if let l = t[key] { return l }; let l = WarmLane(); t[key] = l; return l } }
+        func adopt(_ from: String, _ to: String) -> Bool { m.withLock { guard let l = t[from] else { return false }; t[from] = nil; t[to]?.close(); t[to] = l; return true } }
+        func close(_ key: String) { m.withLock { let l = t[key]; t[key] = nil; return l }?.close() }
         func closeAll() { m.withLock { let all = Array(t.values); t = [:]; return all }.forEach { $0.close() } }
     }
 
@@ -220,6 +222,8 @@ public struct SocksTransport: MailboxTransport {
     }
 
     public func dropWarm() async { lanes.closeAll() }
+    public func adopt(onion: String, spare: String, as lane: String) async -> Bool { lanes.adopt(onion + "|" + spare, onion + "|" + lane) }
+    public func closeLane(onion: String, lane: String) async { lanes.close(onion + "|" + lane) }
 
     public func roundTrip(onion: String, request: [UInt8], isolation: String) async throws -> [UInt8] {
         guard onion.count == 56, onion.allSatisfy({ $0.isASCII && ($0.isLowercase || ("2"..."7").contains($0)) }) else {

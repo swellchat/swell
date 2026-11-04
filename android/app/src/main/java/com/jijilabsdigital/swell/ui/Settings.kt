@@ -155,6 +155,14 @@ fun SettingsScreen(onBack: () -> Unit, onSecureChanged: (Boolean) -> Unit) {
                 "Swell ${BuildConfig.VERSION_NAME} · " + stringResource(R.string.from_jiji),
                 style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
+            // AGPL-3.0 section 5(d): appropriate legal notices and where to get the source.
+            Text(
+                stringResource(R.string.legal_notice),
+                style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            TextButton({
+                context.startActivity(android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse("https://jijilabsdigital.com/swell/source")))
+            }) { Text(stringResource(R.string.legal_source)) }
         }
     }
     if (confirmPhrase) {

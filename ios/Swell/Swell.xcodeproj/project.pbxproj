@@ -14,7 +14,9 @@
 		502578C46778AD0C1226F8E4 /* SwellSignal in Frameworks */ = {isa = PBXBuildFile; productRef = 5BBBD5401D97D81B6AA8C7D5 /* SwellSignal */; };
 		7416036056002CCD95224E24 /* ChatListView.swift in Sources */ = {isa = PBXBuildFile; fileRef = BEFA12B745F3DE770FA68C0B /* ChatListView.swift */; };
 		784AAB5CD026C5FD0B2197F6 /* Theme.swift in Sources */ = {isa = PBXBuildFile; fileRef = BF056F4B2AF7D78F508D143B /* Theme.swift */; };
+		7D693D3734077A517C2CF193 /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 02EE665F2D2765CD4551C2BB /* SettingsView.swift */; };
 		9231CF245695BEF391B8509D /* AppModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = F9CCFBD74115A16C44F70774 /* AppModel.swift */; };
+		939A4BD73FB8BFF02581DE47 /* Gate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 67D3A6BF91B2A570554DB0E7 /* Gate.swift */; };
 		9D73E18B777CC2EF9ADCD981 /* Voice.swift in Sources */ = {isa = PBXBuildFile; fileRef = 489C4E3640B554250CE26288 /* Voice.swift */; };
 		A74EF17AF8A517D4E5C90CA4 /* SwellApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 56D87A8B8BD5C12F8BBDE4B3 /* SwellApp.swift */; };
 		BF5F3914947270F09D562C89 /* SwellCore in Frameworks */ = {isa = PBXBuildFile; productRef = 1DA3F022AA6E387CB25F4E28 /* SwellCore */; };
@@ -41,6 +43,7 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
+		02EE665F2D2765CD4551C2BB /* SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
 		045A35B9EAF1B2BB0982F7CE /* SwellSignal */ = {isa = PBXFileReference; lastKnownFileType = folder; name = SwellSignal; path = ../SwellSignal; sourceTree = SOURCE_ROOT; };
 		2D69476769B027F8DFA8E5E0 /* QR.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QR.swift; sourceTree = "<group>"; };
 		30F52F506F46EA6A8E33AF78 /* SwellCore */ = {isa = PBXFileReference; lastKnownFileType = folder; name = SwellCore; path = ../SwellCore; sourceTree = SOURCE_ROOT; };
@@ -49,6 +52,7 @@
 		56D87A8B8BD5C12F8BBDE4B3 /* SwellApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SwellApp.swift; sourceTree = "<group>"; };
 		5AC8432967241B0AAC978B02 /* Swell.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = Swell.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		5DB74983E0950584D12EFB9B /* Services.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Services.swift; sourceTree = "<group>"; };
+		67D3A6BF91B2A570554DB0E7 /* Gate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Gate.swift; sourceTree = "<group>"; };
 		7029C71D43E3B78E08A53E5F /* TorDynamic */ = {isa = PBXFileReference; lastKnownFileType = folder; name = TorDynamic; path = ../TorDynamic; sourceTree = SOURCE_ROOT; };
 		81B3CF356C4D5495BDFE6F36 /* Swell.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = Swell.entitlements; sourceTree = "<group>"; };
 		84A0BF2DDDF76D26C4D4B334 /* Attach.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Attach.swift; sourceTree = "<group>"; };
@@ -83,10 +87,12 @@
 				84A0BF2DDDF76D26C4D4B334 /* Attach.swift */,
 				BEFA12B745F3DE770FA68C0B /* ChatListView.swift */,
 				DEE620489D6647ED453C2C94 /* ChatView.swift */,
+				67D3A6BF91B2A570554DB0E7 /* Gate.swift */,
 				EDCE7AEC77FEFF0F6A696CC0 /* Info.plist */,
 				F667D7F8F2384E783833F2E5 /* OnboardingView.swift */,
 				2D69476769B027F8DFA8E5E0 /* QR.swift */,
 				5DB74983E0950584D12EFB9B /* Services.swift */,
+				02EE665F2D2765CD4551C2BB /* SettingsView.swift */,
 				81B3CF356C4D5495BDFE6F36 /* Swell.entitlements */,
 				56D87A8B8BD5C12F8BBDE4B3 /* SwellApp.swift */,
 				BF056F4B2AF7D78F508D143B /* Theme.swift */,
@@ -226,9 +232,11 @@
 				D5B7B6538789A09BC659A87A /* Attach.swift in Sources */,
 				7416036056002CCD95224E24 /* ChatListView.swift in Sources */,
 				DAF5B33CC6BFB4EB2029FE00 /* ChatView.swift in Sources */,
+				939A4BD73FB8BFF02581DE47 /* Gate.swift in Sources */,
 				3B47CD419033CC85629613B3 /* OnboardingView.swift in Sources */,
 				EF71CA601C21BD9A1E530B03 /* QR.swift in Sources */,
 				C4F03EEDEDCA092E6A3A0380 /* Services.swift in Sources */,
+				7D693D3734077A517C2CF193 /* SettingsView.swift in Sources */,
 				A74EF17AF8A517D4E5C90CA4 /* SwellApp.swift in Sources */,
 				784AAB5CD026C5FD0B2197F6 /* Theme.swift in Sources */,
 				D79DA11F0B357BA0DE1606AC /* TorService.swift in Sources */,

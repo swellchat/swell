@@ -15,6 +15,7 @@ struct ChatView: View {
     @State private var typingOff: Task<Void, Never>?
     @StateObject private var recorder = VoiceRecorder()
     @FocusState private var focused: Bool
+    @State private var showPrivacy = Debug.has("-swellPrivacy")
     @State private var showAttach = false
     @State private var picker: AttachKind?
     @State private var pendingPicker: AttachKind?
@@ -40,6 +41,13 @@ struct ChatView: View {
                         Label("Messages disappear after \(Self.timerName(c.expireSec))", systemImage: "timer")
                             .font(.footnote).foregroundStyle(.secondary).padding(.vertical, 6)
                     }
+                    if !isNote {
+                        Label("Messages are end-to-end encrypted. No one else can read them, not even Jiji Labs.", systemImage: "lock.fill")
+                            .font(.caption).foregroundStyle(.secondary).multilineTextAlignment(.center)
+                            .padding(.horizontal, 14).padding(.vertical, 8)
+                            .background(Capsule(style: .continuous).fill(Ocean.card.opacity(0.9)))
+                            .padding(.bottom, 8)
+                    }
                     if model.messages.isEmpty && model.messagesLoaded {
                         VStack(spacing: 8) {
                             Image(systemName: isNote ? "note.text" : "lock.fill").font(.title2).foregroundStyle(Ocean.accent)
@@ -48,13 +56,20 @@ struct ChatView: View {
                                 .font(.footnote).foregroundStyle(.secondary).multilineTextAlignment(.center)
                         }.padding(.top, 60)
                     }
-                    ForEach(model.messages) { m in
+                    ForEach(Array(model.messages.enumerated()), id: \.element.id) { i, m in
+                        let prev = i > 0 ? model.messages[i - 1] : nil, next = i + 1 < model.messages.count ? model.messages[i + 1] : nil
+                        let newDay = prev == nil || !Calendar.current.isDate(Date(timeIntervalSince1970: Double(prev!.sentAt) / 1000), inSameDayAs: Date(timeIntervalSince1970: Double(m.sentAt) / 1000))
+                        let sameAsPrev = !newDay && prev?.incoming == m.incoming && m.sentAt - (prev?.sentAt ?? 0) < 120_000
+                        let sameAsNext: Bool = { guard let n = next else { return false }
+                            return Calendar.current.isDate(Date(timeIntervalSince1970: Double(n.sentAt) / 1000), inSameDayAs: Date(timeIntervalSince1970: Double(m.sentAt) / 1000)) && n.incoming == m.incoming && n.sentAt - m.sentAt < 120_000 }()
+                        if newDay { DaySeparator(ms: m.sentAt).padding(.top, i == 0 ? 0 : 10) }
                         Bubble(message: m, quoted: quote(for: m), isLast: m.id == lastOutgoing, isNote: isNote,
-                               peerCanModify: isNote || (contact?.supportsV11 ?? false),
+                               peerCanModify: isNote || (contact?.supportsV11 ?? false), tail: !sameAsNext,
                                retry: { model.retry(m) }, reply: { replyTo = m; editing = nil; focused = true },
                                edit: { editing = m; replyTo = nil; draft = m.text; focused = true },
                                delete: { deleting = m })
                             .id(m.id)
+                            .padding(.top, sameAsPrev ? -3 : 4)
                     }
                 }.padding(.horizontal, 16).padding(.vertical, 12)
             }
@@ -81,6 +96,12 @@ struct ChatView: View {
             }
             if !isNote {
                 ToolbarItem(placement: .topBarTrailing) {
+                    Button { showPrivacy = true } label: {
+                        Image(systemName: (contact?.verified ?? false) ? "checkmark.shield.fill" : "shield.lefthalf.filled")
+                            .foregroundStyle((contact?.verified ?? false) ? Ocean.accent : Color.secondary)
+                    }.accessibilityLabel("Privacy check")
+                }
+                ToolbarItem(placement: .topBarTrailing) {
                     Menu {
                         Button { showInfo = true } label: { Label("Contact info", systemImage: "info.circle") }
                         Menu {
@@ -95,6 +116,7 @@ struct ChatView: View {
             }
         }
         .sheet(isPresented: $showInfo) { ContactInfo(contactId: contactId) }
+        .sheet(isPresented: $showPrivacy) { PrivacyCheck(contactId: contactId, openInfo: { showPrivacy = false; DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { showInfo = true } }) }
         .confirmationDialog("Delete this message?", isPresented: Binding(get: { deleting != nil }, set: { if !$0 { deleting = nil } }), titleVisibility: .visible, presenting: deleting) { m in
             Button("Delete for me", role: .destructive) { model.deleteHere(m) }
             if !m.incoming && (isNote || (contact?.supportsV11 ?? false)) {
@@ -250,6 +272,7 @@ private struct Bubble: View {
     let isLast: Bool
     let isNote: Bool
     let peerCanModify: Bool
+    var tail = true
     let retry: () -> Void
     let reply: () -> Void
     let edit: () -> Void
@@ -297,10 +320,10 @@ private struct Bubble: View {
                     }
                 }
                 .padding(.horizontal, 14).padding(.vertical, 9)
-                .background(RoundedRectangle(cornerRadius: 18, style: .continuous).fill(mine ? AnyShapeStyle(Ocean.bubble) : AnyShapeStyle(Ocean.incoming)))
+                .background(UnevenRoundedRectangle(topLeadingRadius: 18, bottomLeadingRadius: (!mine && tail) ? 5 : 18, bottomTrailingRadius: (mine && tail) ? 5 : 18, topTrailingRadius: 18, style: .continuous).fill(mine ? AnyShapeStyle(Ocean.bubble) : AnyShapeStyle(Ocean.incoming)))
                 .overlay(alignment: mine ? .bottomLeading : .bottomTrailing) { reactions.offset(y: 14) }
                 .contextMenu { menu }
-                HStack(spacing: 4) {
+                if tail || message.status == .failed { HStack(spacing: 4) {
                     Text(message.sentAt.time).font(.caption2).foregroundStyle(.secondary)
                     if message.edited && !message.deleted { Text("Edited").font(.caption2).foregroundStyle(.secondary) }
                     if let s = status {
@@ -310,7 +333,7 @@ private struct Bubble: View {
                 }
                 .padding(.top, message.myReaction.isEmpty && message.theirReaction.isEmpty ? 0 : 14)
                 .accessibilityElement(children: .combine)
-                .accessibilityLabel(status?.text ?? "")
+                .accessibilityLabel(status?.text ?? "") }
             }
             .padding(.bottom, 6)
             .onTapGesture { if message.status == .failed { retry() } }
@@ -532,5 +555,79 @@ private struct AttachSheet: View {
                 Spacer()
             }.padding(.horizontal, 20).padding(.vertical, 8).contentShape(Rectangle())
         }.buttonStyle(.plain)
+    }
+}
+
+
+/// One screen with the live privacy state of a chat. Every row with a chevron or a control does something.
+struct PrivacyCheck: View {
+    @EnvironmentObject var model: AppModel
+    @Environment(\.dismiss) private var dismiss
+    let contactId: String
+    let openInfo: () -> Void
+    private var c: Contact? { model.contacts.first { $0.id == contactId } }
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(spacing: 14) {
+                    ZStack {
+                        Circle().fill((c?.verified ?? false) ? AnyShapeStyle(Ocean.bubble) : AnyShapeStyle(Ocean.card)).frame(width: 84, height: 84)
+                        Image(systemName: (c?.verified ?? false) ? "checkmark.shield.fill" : "shield.lefthalf.filled").font(.system(size: 38)).foregroundStyle((c?.verified ?? false) ? Color.white : Ocean.accent)
+                    }.padding(.top, 8).accessibilityHidden(true)
+                    Text((c?.verified ?? false) ? "This chat is verified" : "Not verified yet").font(.title3.weight(.semibold))
+                    Text("Live state for \(c?.displayName ?? "this chat").").font(.footnote).foregroundStyle(.secondary)
+                    VStack(spacing: 0) {
+                        info("lock.fill", "Encrypted end to end", "On. Only the two of you can read it.")
+                        sep
+                        info("atom", "Post-quantum handshake", "On. The first key exchange also uses a quantum-resistant method.")
+                        sep
+                        Button(action: openInfo) {
+                            line("checkmark.seal", "Verified in person", (c?.verified ?? false) ? "Yes" : "No. Compare safety codes.", chevron: true)
+                        }.buttonStyle(.plain)
+                        sep
+                        Menu {
+                            ForEach([Int32(0), 3600, 86400, 7 * 86400], id: \.self) { sec in
+                                Button { model.setDisappearing(contactId, seconds: Int(sec)) } label: {
+                                    if (c?.expireSec ?? 0) == sec { Label(ChatView.timerName(sec), systemImage: "checkmark") } else { Text(ChatView.timerName(sec)) }
+                                }
+                            }
+                        } label: { line("timer", "Disappearing messages", ChatView.timerName(c?.expireSec ?? 0), chevron: true) }.buttonStyle(.plain)
+                        sep
+                        HStack {
+                            Image(systemName: "checkmark.circle").foregroundStyle(Ocean.accent).frame(width: 28)
+                            VStack(alignment: .leading, spacing: 1) { Text("Read receipts").foregroundStyle(.primary); Text(model.receipts ? "On" : "Off").font(.footnote).foregroundStyle(.secondary) }
+                            Spacer()
+                            Toggle("", isOn: $model.receipts).labelsHidden()
+                        }.padding(14)
+                    }.background(RoundedRectangle(cornerRadius: 18, style: .continuous).fill(Ocean.card))
+                }.padding(16)
+            }
+            .background(Ocean.background.ignoresSafeArea())
+            .navigationTitle("Privacy check").navigationBarTitleDisplayMode(.inline)
+            .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
+        }
+        .presentationBackground(.ultraThinMaterial)
+    }
+    private var sep: some View { Rectangle().fill(Ocean.hairline).frame(height: 0.5).padding(.leading, 56) }
+    private func info(_ icon: String, _ t: String, _ sub: String) -> some View { line(icon, t, sub, chevron: false) }
+    private func line(_ icon: String, _ t: String, _ sub: String, chevron: Bool) -> some View {
+        HStack(spacing: 0) {
+            Image(systemName: icon).foregroundStyle(Ocean.accent).frame(width: 28)
+            VStack(alignment: .leading, spacing: 1) { Text(t).foregroundStyle(.primary); Text(sub).font(.footnote).foregroundStyle(.secondary).multilineTextAlignment(.leading) }.padding(.leading, 14)
+            Spacer()
+            if chevron { Image(systemName: "chevron.right").font(.footnote.weight(.semibold)).foregroundStyle(.tertiary) }
+        }.padding(14).contentShape(Rectangle())
+    }
+}
+
+
+struct DaySeparator: View {
+    let ms: Int64
+    var body: some View {
+        let d = Date(timeIntervalSince1970: Double(ms) / 1000)
+        let t = Calendar.current.isDateInToday(d) ? "Today" : Calendar.current.isDateInYesterday(d) ? "Yesterday" : d.formatted(.dateTime.weekday(.wide).day().month(.abbreviated))
+        Text(t).font(.caption.weight(.medium)).foregroundStyle(.secondary).padding(.horizontal, 12).padding(.vertical, 4)
+            .background(Capsule().fill(Ocean.card.opacity(0.9))).padding(.vertical, 6).accessibilityAddTraits(.isHeader)
     }
 }

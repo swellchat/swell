@@ -92,6 +92,10 @@ public actor Engine {
         self.account = account; self.kv = kv; self.transport = transport; self.auth = auth
         self.mailboxOnion = mailboxOnion; self.profileName = profileName; self.powBits = powBits; self.now = now
         crypto = try LibSignalCrypto(account: account, kv: kv)
+        // A random key that exists only in this phone's store: it fixes which receive lane a queue belongs to.
+        var lk = kv.get("acct", "lanekey") ?? []
+        if lk.count != 32 { lk = Codec.random(32); try kv.batch { kv.put("acct", "lanekey", lk) } }
+        plan = LanePlan(deviceKey: lk)
     }
 
     public func setOnChange(_ f: (@Sendable () -> Void)?) { onChange = f }
@@ -237,16 +241,79 @@ public actor Engine {
 
     private func tag() -> String { Codec.hex(Codec.random(8)) }
 
-    /// A mailbox call. In the foreground it rides the warm stream (no new circuit and handshake per call);
-    /// in the background each call is a fresh stream.
-    private func mb(_ onion: String, _ req: [UInt8]) async throws -> [UInt8] {
-        if foreground { return try await transport.warmRoundTrip(onion: onion, request: req, lane: "io", seconds: 60) }
-        return try await transport.roundTrip(onion: onion, request: req, isolation: tag())
+    // MARK: lanes (docs/DESIGN-SWELL-LANES.md)
+
+    static let inviteLane = "i0"
+    private var plan: LanePlan
+    /// Contacts in Private Mode: their queue gets a receive lane of its own.
+    public private(set) var privateContacts: Set<String> = []
+    public func setPrivate(_ contactId: String, _ on: Bool) { if on { privateContacts.insert(contactId) } else { privateContacts.remove(contactId) } }
+    private var spares: [(name: String, born: Date)] = []
+    private var sendLanes: [String: (onion: String, last: Date)] = [:]
+    private var waitsActive = false
+    /// The (lane, kind) of every foreground mailbox call, for tests and diagnostics: kind is the mailbox op byte.
+    private func receiveLane(secret: [UInt8]) -> String {
+        let owner = privateContacts.isEmpty ? nil : contacts().first(where: { $0.myQueueSecret == secret && privateContacts.contains($0.id) })?.id
+        return plan.receiveLane(queueId: MailboxProtocol.queueId(secret: secret), privateContact: owner)
     }
 
-    /// Opens the warm stream to our mailbox ahead of the first call (app launch / foreground).
-    public func prewarm() async { if !mailboxOnion.isEmpty, !stopped { await transport.warmUp(onion: mailboxOnion, lane: "io") } }
-    public func dropWarm() async { await transport.dropWarm() }
+    func laneForTesting(secret: [UInt8]) -> String { receiveLane(secret: secret) }
+
+    /// A mailbox call on one of OUR queues (create, get, ack, peek). Foreground: the queue's receive lane (or `lane`, or the invite
+    /// lane); while the long polls run, a call that is not one of them takes a fresh stream so it does not wait behind a WAIT.
+    /// Background: a fresh stream per call. `fresh` forces a fresh stream.
+    private func mb(_ onion: String, _ req: [UInt8], secret: [UInt8]? = nil, lane: String? = nil, fresh: Bool = false) async throws -> [UInt8] {
+        guard foreground, !fresh else { return try await transport.roundTrip(onion: onion, request: req, isolation: tag()) }
+        let l = lane ?? secret.map { receiveLane(secret: $0) } ?? Engine.inviteLane
+        if waitsActive, lane == nil, secret != nil { return try await transport.roundTrip(onion: onion, request: req, isolation: tag()) }
+        return try await transport.warmRoundTrip(onion: onion, request: req, lane: l, seconds: 60)
+    }
+
+    /// A PUT to a contact's queue. Foreground: that contact's own send lane (never shared with another contact or a receive lane);
+    /// the first send takes a pre-opened spare stream, so there is no path setup. Background: a fresh stream.
+    private func mbPut(to c: Contact, _ req: [UInt8]) async throws -> [UInt8] {
+        guard foreground else { return try await transport.roundTrip(onion: c.peerMailbox, request: req, isolation: tag()) }
+        let lane = plan.sendLane(contactId: c.id)
+        if sendLanes[lane] == nil, c.peerMailbox == mailboxOnion, !spares.isEmpty {
+            let sp = spares.removeFirst()
+            _ = await transport.adopt(onion: mailboxOnion, spare: sp.name, as: lane)
+            Task { await self.refillSpares() }
+        }
+        sendLanes[lane] = (c.peerMailbox, now())
+        return try await transport.warmRoundTrip(onion: c.peerMailbox, request: req, lane: lane, seconds: 60)
+    }
+
+    /// Keeps two unassigned streams open (and a few lanes warm); refills after one is taken.
+    private func refillSpares() async {
+        guard foreground, !stopped, !mailboxOnion.isEmpty else { return }
+        while spares.count < LanePlan.spareCount {
+            let n = LanePlan.newSpareName(); spares.append((n, now()))
+            let onion = mailboxOnion
+            Task { await self.transport.warmUp(onion: onion, lane: n) }
+        }
+    }
+
+    /// Every ~20 s: a no-op on the spares and on send lanes used in the last 120 s (the server closes a stream idle for 30 s), closes
+    /// idle send lanes, and renews spares before the server's 10-minute stream limit.
+    private func maintainLanes() async {
+        let t = now()
+        for (lane, v) in sendLanes where t.timeIntervalSince(v.last) > LanePlan.sendIdleSeconds {
+            sendLanes[lane] = nil; await transport.closeLane(onion: v.onion, lane: lane)
+        }
+        for sp in spares where t.timeIntervalSince(sp.born) > 8 * 60 {
+            spares.removeAll { $0.name == sp.name }; await transport.closeLane(onion: mailboxOnion, lane: sp.name)
+        }
+        await refillSpares()
+        let ping = (try? MailboxProtocol.getRequest(secrets: [Codec.random(32)])) ?? []
+        guard !ping.isEmpty else { return }
+        for sp in spares { if (try? await transport.warmRoundTrip(onion: mailboxOnion, request: ping, lane: sp.name, seconds: 20)) == nil { spares.removeAll { $0.name == sp.name } } }
+        for (lane, v) in sendLanes { _ = try? await transport.warmRoundTrip(onion: v.onion, request: ping, lane: lane, seconds: 20) }
+        await refillSpares()
+    }
+
+    /// Opens the spare streams ahead of the first send (app launch / foreground).
+    public func prewarm() async { await refillSpares() }
+    public func dropWarm() async { spares = []; sendLanes = [:]; await transport.dropWarm() }
 
     // MARK: live receive (WAIT)
 
@@ -278,16 +345,35 @@ public actor Engine {
             guard !mailboxOnion.isEmpty else { try? await Task.sleep(nanoseconds: 2_000_000_000); continue }
             await pollImpl()
             await retryHandshakes()
-            let secrets = contacts().filter { $0.queueReady }.sorted { $0.id < $1.id }.map { $0.myQueueSecret }
+            let ready = contacts().filter { $0.queueReady }.sorted { $0.id < $1.id }
+            let secrets = ready.map { $0.myQueueSecret }
             guard waitSupported, !secrets.isEmpty else {
                 try? await Task.sleep(nanoseconds: waitSupported ? 3_000_000_000 : UInt64(fallbackPollSeconds * 1_000_000_000)); continue
             }
             let sig = queueSignature()
-            let groups = stride(from: 0, to: secrets.count, by: waitGroupSize).map {
-                Array(secrets[$0..<min($0 + waitGroupSize, secrets.count)])
+            // Receive lanes: a fixed group per queue (HMAC of a device-only key), each with its own stream and WAIT loop. Normally a lane
+            // holds all its queues in one WAIT; an older mailbox takes 8 queues per WAIT, then the extra ones get a numbered sub-lane.
+            var byLane: [String: [[UInt8]]] = [:]
+            for c in ready { byLane[receiveLane(secret: c.myQueueSecret), default: []].append(c.myQueueSecret) }
+            var groups: [(lane: String, secrets: [[UInt8]])] = []
+            for (lane, list) in byLane.sorted(by: { $0.key < $1.key }) {
+                for (k, start) in stride(from: 0, to: list.count, by: waitGroupSize).enumerated() {
+                    groups.append((k == 0 ? lane : "\(lane).\(k)", Array(list[start..<min(start + waitGroupSize, list.count)])))
+                }
             }
+            waitsActive = true
+            defer { waitsActive = false }
             await withTaskGroup(of: Void.self) { g in
-                for (i, grp) in groups.enumerated() { g.addTask { await self.waitLoop(grp, lane: "wait\(i)") } }
+                for grp in groups {
+                    let delay = UInt64.random(in: 0...3_000) // lanes open at random offsets of 0-3 s, not all at once
+                    g.addTask { try? await Task.sleep(nanoseconds: delay * 1_000_000); await self.waitLoop(grp.secrets, lane: grp.lane) }
+                }
+                g.addTask { // spares and warm send lanes
+                    while !Task.isCancelled {
+                        await self.maintainLanes()
+                        try? await Task.sleep(nanoseconds: 20_000_000_000)
+                    }
+                }
                 g.addTask { // open invite queues always hold our bundle, so WAIT would answer at once: look every 5 s instead
                     while !Task.isCancelled {
                         try? await Task.sleep(nanoseconds: 5_000_000_000)
@@ -319,6 +405,9 @@ public actor Engine {
                     return
                 }
                 let items = try MailboxProtocol.parseList(r)
+                #if DEBUG
+                if ProcessInfo.processInfo.arguments.contains("-swellTrace") { fputs("SWELL wait \(lane) q=\(secrets.count) -> \(items.count) items after \(String(format: "%.2f", Date().timeIntervalSince(started)))s at \(Int(Date().timeIntervalSince1970 * 1000))\n", stderr) }
+                #endif
                 var allAcked = true
                 for idx in Set(items.map { $0.index }).sorted() where idx >= 0 && idx < secrets.count {
                     var ack: [String] = []
@@ -326,7 +415,7 @@ public actor Engine {
                     for it in mine { if handleEnvelope(it.envelope) { ack.append(it.id) } }
                     if ack.count < mine.count { allAcked = false }
                     if !ack.isEmpty {
-                        _ = try? await retrying(2, "ack") { try await mb(mailboxOnion, MailboxProtocol.ackRequest(secret: secrets[idx], ids: ack)) }
+                        _ = try? await retrying(2, "ack") { try await mb(mailboxOnion, MailboxProtocol.ackRequest(secret: secrets[idx], ids: ack), secret: secrets[idx], lane: lane) }
                     }
                 }
                 if !items.isEmpty { changed(); await flushReceipts() }
@@ -372,7 +461,7 @@ public actor Engine {
             let nonce = await withTaskCancellationHandler { await nonceTask.value } onCancel: { nonceTask.cancel() }
             if nonce == MailboxProtocol.powCancelled || Task.isCancelled { throw CancellationError() }
             let created = try await retrying(3, "queue") {
-                try await mb(mailboxOnion, MailboxProtocol.createRequest(secret: secret, nonce: nonce))
+                try await mb(mailboxOnion, MailboxProtocol.createRequest(secret: secret, nonce: nonce), secret: secret)
             }
             try MailboxProtocol.parseOK(created)
             c.queueReady = true
@@ -519,10 +608,10 @@ public actor Engine {
             i.nonce = n; try? kv.batch { save(i) }
         }
         do {
-            try MailboxProtocol.parseOK(try await retrying(2, "queue") { try await mb(mailboxOnion, MailboxProtocol.createRequest(secret: i.secret, nonce: i.nonce)) })
-            try MailboxProtocol.parseOK(try await retrying(2, "put") { try await mb(mailboxOnion, MailboxProtocol.putRequest(queueId: i.queueId, envelope: i.envelope)) })
+            try MailboxProtocol.parseOK(try await retrying(2, "queue") { try await mb(mailboxOnion, MailboxProtocol.createRequest(secret: i.secret, nonce: i.nonce), lane: Engine.inviteLane) })
+            try MailboxProtocol.parseOK(try await retrying(2, "put") { try await mb(mailboxOnion, MailboxProtocol.putRequest(queueId: i.queueId, envelope: i.envelope), fresh: true) })
         } catch { return } // offline: retried at the next pass
-        let probe = try? await retrying(2, "peek") { try await mb(mailboxOnion, MailboxProtocol.peekRequest(queueId: i.queueId)) }
+        let probe = try? await retrying(2, "peek") { try await mb(mailboxOnion, MailboxProtocol.peekRequest(queueId: i.queueId), lane: Engine.inviteLane) }
         guard let probe else { return }
         if let items = try? MailboxProtocol.parseList(probe), items.count == 1 {
             i.ready = true; try? kv.batch { save(i); kv.put("acct", "peek", [1]) }
@@ -538,8 +627,8 @@ public actor Engine {
     /// Deletes every envelope of a queue we own (GET, then ACK what came back).
     private func clearQueue(secret: [UInt8]) async {
         for _ in 0..<3 {
-            guard let items = try? MailboxProtocol.parseList(try await mb(mailboxOnion, MailboxProtocol.getRequest(secrets: [secret]))), !items.isEmpty else { return }
-            _ = try? await mb(mailboxOnion, MailboxProtocol.ackRequest(secret: secret, ids: items.map { $0.id }))
+            guard let items = try? MailboxProtocol.parseList(try await mb(mailboxOnion, MailboxProtocol.getRequest(secrets: [secret]), secret: secret)), !items.isEmpty else { return }
+            _ = try? await mb(mailboxOnion, MailboxProtocol.ackRequest(secret: secret, ids: items.map { $0.id }), secret: secret)
         }
     }
 
@@ -557,7 +646,7 @@ public actor Engine {
         for inv in openInvites().filter({ $0.ready }).shuffled() {
             if Task.isCancelled || stopped { return }
             guard let items = try? await retrying(2, "get", {
-                try MailboxProtocol.parseList(try await mb(mailboxOnion, MailboxProtocol.getRequest(secrets: [inv.secret])))
+                try MailboxProtocol.parseList(try await mb(mailboxOnion, MailboxProtocol.getRequest(secrets: [inv.secret]), lane: Engine.inviteLane))
             }), !items.isEmpty else { continue }
             await processInvite(inv, items)
         }
@@ -568,12 +657,12 @@ public actor Engine {
     private func processInvite(_ inv: OpenInvite, _ items: [MailboxProtocol.Item]) async {
         guard let h = items.first(where: { $0.envelope.count > 2 && $0.envelope[1] == UInt8(PeerFrame.hello) }) else { return }
         if let c = try? acceptHello(h.envelope, invite: inv) {
-            _ = try? await retrying(2, "ack") { try await mb(mailboxOnion, MailboxProtocol.ackRequest(secret: inv.secret, ids: items.map { $0.id })) }
+            _ = try? await retrying(2, "ack") { try await mb(mailboxOnion, MailboxProtocol.ackRequest(secret: inv.secret, ids: items.map { $0.id }), lane: Engine.inviteLane) }
             changed()
             Task { await self.prepareInvites() } // one was used: refill
             await finishHandshake(c)
         } else {
-            _ = try? await retrying(2, "ack") { try await mb(mailboxOnion, MailboxProtocol.ackRequest(secret: inv.secret, ids: [h.id])) }
+            _ = try? await retrying(2, "ack") { try await mb(mailboxOnion, MailboxProtocol.ackRequest(secret: inv.secret, ids: [h.id]), lane: Engine.inviteLane) }
         }
     }
 
@@ -616,7 +705,7 @@ public actor Engine {
         let nonce = await Task.detached(priority: .userInitiated) { MailboxProtocol.solvePow(queueId: MailboxProtocol.queueId(secret: secret), bits: bits) }.value
         if nonce == MailboxProtocol.powCancelled { return }
         do {
-            try MailboxProtocol.parseOK(try await retrying(3, "queue") { try await mb(mailboxOnion, MailboxProtocol.createRequest(secret: secret, nonce: nonce)) })
+            try MailboxProtocol.parseOK(try await retrying(3, "queue") { try await mb(mailboxOnion, MailboxProtocol.createRequest(secret: secret, nonce: nonce), secret: secret) })
             c.queueReady = true
             try kv.batch { save(c) }
             let state = Out().u8(5).str(profileName).str(mailboxOnion).bytes(MailboxProtocol.queueId(secret: secret)).str("").bytes(c.myAuth).i32(Engine.caps).done()
@@ -657,7 +746,7 @@ public actor Engine {
         do {
             let nonce = await withTaskCancellationHandler { await nonceTask.value } onCancel: { nonceTask.cancel() }
             if nonce == MailboxProtocol.powCancelled || Task.isCancelled { throw CancellationError() }
-            try MailboxProtocol.parseOK(try await retrying(3, "queue") { try await mb(mailboxOnion, MailboxProtocol.createRequest(secret: secret, nonce: nonce)) })
+            try MailboxProtocol.parseOK(try await retrying(3, "queue") { try await mb(mailboxOnion, MailboxProtocol.createRequest(secret: secret, nonce: nonce), secret: secret) })
             c.queueReady = true
             let msgId = Codec.random(16), at = millis()
             let hello = Out().u8(1).str("").str(profileName).str(mailboxOnion).bytes(MailboxProtocol.queueId(secret: secret)).bytes(c.myAuth)
@@ -783,7 +872,7 @@ public actor Engine {
         }
         guard mailbox, c.hasMailbox else { throw lastError }
         let r = try await retrying(2, "put") {
-            try await mb(c.peerMailbox, MailboxProtocol.putRequest(queueId: c.peerQueue, envelope: frame))
+            try await mbPut(to: c, MailboxProtocol.putRequest(queueId: c.peerQueue, envelope: frame))
         }
         try MailboxProtocol.parseOK(r)
         return .queued
@@ -806,13 +895,13 @@ public actor Engine {
             for _ in 0..<10 {
                 if Task.isCancelled || stopped { return total }
                 guard let items = try? await retrying(2, "get", {
-                    try MailboxProtocol.parseList(try await mb(mailboxOnion, MailboxProtocol.getRequest(secrets: [c.myQueueSecret])))
+                    try MailboxProtocol.parseList(try await mb(mailboxOnion, MailboxProtocol.getRequest(secrets: [c.myQueueSecret]), secret: c.myQueueSecret))
                 }), !items.isEmpty else { break }
                 var ack: [String] = []
                 for it in items { if handleEnvelope(it.envelope) { ack.append(it.id) } }
                 if !ack.isEmpty {
                     _ = try? await retrying(2, "ack") {
-                        try await mb(mailboxOnion, MailboxProtocol.ackRequest(secret: c.myQueueSecret, ids: ack))
+                        try await mb(mailboxOnion, MailboxProtocol.ackRequest(secret: c.myQueueSecret, ids: ack), secret: c.myQueueSecret)
                     }
                 }
                 total += items.count
@@ -1155,6 +1244,32 @@ public actor Engine {
         guard contactId != Engine.noteId, let c = loadContact(contactId), c.supportsV11, !c.blocked, let raw = try? Codec.unhex(messageId) else { return }
         _ = try await track { try await self.sendInner(Out().u8(10).u8(1).raw(raw).str("").done(), to: c) }
     }
+
+    /// Chat-list flags kept on this phone only (never sent): 1 pinned, 2 archived, 4 marked unread.
+    public func chatFlags() -> [String: UInt8] {
+        var out: [String: UInt8] = [:]
+        for (k, v) in kv.list("cmeta") { if let f = v.first, f != 0 { out[k] = f } }
+        return out
+    }
+    public func setChatFlag(_ id: String, _ flag: UInt8, _ on: Bool) throws {
+        var f = kv.get("cmeta", id)?.first ?? 0
+        if on { f |= flag } else { f &= ~flag }
+        try kv.batch { if f == 0 { kv.delete("cmeta", id) } else { kv.put("cmeta", id, [f]) } }
+        changed()
+    }
+
+    /// What the mailbox holds for our queues right now, from this phone's point of view: per queue a short id, the number of
+    /// sealed envelopes waiting and their sizes. A read-only GET (nothing is acknowledged).
+    public func mailboxView() async -> [(queue: String, envelopes: Int, bytes: Int)] {
+        var out: [(String, Int, Int)] = []
+        for c in contacts() where c.queueReady && !mailboxOnion.isEmpty {
+            let q = Codec.hex(MailboxProtocol.queueId(secret: c.myQueueSecret))
+            let items = (try? MailboxProtocol.parseList(try await transport.roundTrip(onion: mailboxOnion, request: MailboxProtocol.getRequest(secrets: [c.myQueueSecret]), isolation: tag()))) ?? []
+            out.append((String(q.prefix(8)), items.count, items.reduce(0) { $0 + $1.envelope.count }))
+        }
+        return out
+    }
+    public var queueCount: Int { contacts().filter { $0.queueReady }.count }
 
     /// Removes a message from this phone only.
     public func deleteHere(_ messageId: String, in contactId: String) throws {

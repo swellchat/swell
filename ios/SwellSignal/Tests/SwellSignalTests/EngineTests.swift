@@ -29,9 +29,16 @@ final class FakeNet: MailboxTransport, @unchecked Sendable {
         Invite(onion: inviterOnion, secret: inviteSecret, identityKey: inviter.identityKey, authKey: Codec.random(32))
     }
 
+    /// Every mailbox call: (op byte, stream tag). Warm lanes use the lane name as the tag, fresh calls a random one.
+    var calls: [(op: UInt8, tag: String)] = []
+    var adopted: [(spare: String, lane: String)] = []
     func roundTrip(onion: String, request: [UInt8], isolation: String) async throws -> [UInt8] {
-        try lock.withLock { try handle(onion, request) }
+        try lock.withLock {
+            if onion == mailbox, request.count > 1 { calls.append((request[1], isolation)) }
+            return try handle(onion, request)
+        }
     }
+    func adopt(onion: String, spare: String, as lane: String) async -> Bool { lock.withLock { adopted.append((spare, lane)) }; return true }
 
     func state() -> [UInt8] {
         Out().u8(5).str("Kotlin Peer").str(mailbox).bytes(Codec.random(32)).str(inviterOnion).bytes(Codec.random(32)).i32(peerState).done()
@@ -467,7 +474,7 @@ final class EngineTests: XCTestCase {
         let net = try FakeNet(); net.maxWaitQueues = 8
         let e = try engine(net, MemoryKeyValueStore())
         await e.setFallbackPoll(0.5)
-        for _ in 0..<9 { _ = try await e.redeem(net.invite(), firstText: "Hi") } // 9 queues: one WAIT of 64 is rejected by this old mailbox
+        for _ in 0..<33 { _ = try await e.redeem(net.invite(), firstText: "Hi") } // 33 queues over 4 lanes: one lane holds 9 or more, and a WAIT of 9 is rejected by this old mailbox
         let listener = Task { await e.listen() }
         try await Task.sleep(nanoseconds: 3_000_000_000)
         listener.cancel()

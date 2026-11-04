@@ -63,28 +63,59 @@ private struct WelcomeStep: View {
     @State private var agreed = false
     @State private var showTerms = false
     var body: some View {
-        Page {
-            HStack { Spacer(); BrandMark(size: 120); Spacer() }.padding(.top, 8)
-            VStack(spacing: 8) {
-                Text("Swell").font(.largeTitle.bold())
-                Text("Private chat without a phone number.").font(.title3).foregroundStyle(.secondary).multilineTextAlignment(.center)
-            }.frame(maxWidth: .infinity)
-            VStack(alignment: .leading, spacing: 14) {
-                Point(symbol: "person.crop.circle.badge.xmark", text: "No phone number, email or username.")
-                Point(symbol: "lock.fill", text: "Messages are end-to-end encrypted.")
-                Point(symbol: "network", text: "Messages are routed privately, so your contacts never see where you are.")
-                Point(symbol: "hand.raised.fill", text: "Free. No ads. No tracking.")
-            }.padding(.vertical, 8)
-            Toggle(isOn: $agreed) {
-                HStack(spacing: 0) {
-                    Text("I agree to the ").font(.footnote)
-                    Button("Terms of Use") { showTerms = true }.font(.footnote.weight(.semibold))
-                }
-            }.toggleStyle(CheckToggle())
-            Button("Get started") { model.createAccount() }.buttonStyle(PrimaryButton()).disabled(!agreed)
-            Button("I have a recovery phrase") { model.stage = .restore }.buttonStyle(SecondaryButton()).disabled(!agreed)
+        ZStack {
+            WaveBackdrop().ignoresSafeArea()
+            Page {
+                HStack { Spacer(); BrandMark(size: 104); Spacer() }.padding(.top, 20)
+                VStack(spacing: 10) {
+                    Text("Swell").font(.system(size: 40, weight: .bold, design: .rounded))
+                    Text("Chat with no phone number and no account. Only the two of you hold the keys.")
+                        .font(.title3).foregroundStyle(.secondary).multilineTextAlignment(.center)
+                }.frame(maxWidth: .infinity)
+                VStack(spacing: 10) {
+                    Benefit(symbol: "person.crop.circle.badge.xmark", title: "No sign-up", text: "No phone number, email or username.")
+                    Benefit(symbol: "lock.fill", title: "Sealed on your iPhone", text: "Not even Jiji Labs can read a message.")
+                    Benefit(symbol: "eye.slash.fill", title: "Free of tracking", text: "No ads. Nobody learns who you talk to.")
+                }.padding(.vertical, 6)
+                Toggle(isOn: $agreed) {
+                    HStack(spacing: 0) {
+                        Text("I agree to the ").font(.footnote)
+                        Button("Terms of Use") { showTerms = true }.font(.footnote.weight(.semibold))
+                    }
+                }.toggleStyle(CheckToggle())
+                Button("Start") { model.createAccount() }.buttonStyle(PrimaryButton()).disabled(!agreed)
+                Button("I have a recovery phrase") { model.stage = .restore }.buttonStyle(SecondaryButton()).disabled(!agreed)
+            }
         }
         .sheet(isPresented: $showTerms) { TermsSheet() }
+    }
+}
+
+/// A slow, soft drift of two glows behind the welcome screen. Under 10% brightness, and still when Reduce Motion is on.
+struct WaveBackdrop: View {
+    @Environment(\.accessibilityReduceMotion) private var still
+    var body: some View {
+        TimelineView(.animation(minimumInterval: 1.0 / 20, paused: still)) { ctx in
+            let t = still ? 0 : ctx.date.timeIntervalSinceReferenceDate / 9
+            ZStack {
+                Ocean.background
+                Circle().fill(Ocean.accent.opacity(0.22)).frame(width: 380).blur(radius: 90).offset(x: CGFloat(sin(t)) * 70 - 60, y: -250 + CGFloat(cos(t * 0.8)) * 40)
+                Circle().fill(Ocean.cyan.opacity(0.16)).frame(width: 320).blur(radius: 90).offset(x: CGFloat(cos(t * 0.9)) * 80 + 90, y: 280 + CGFloat(sin(t * 0.7)) * 50)
+            }
+        }
+    }
+}
+
+private struct Benefit: View {
+    let symbol: String, title: String, text: String
+    var body: some View {
+        HStack(spacing: 14) {
+            Image(systemName: symbol).font(.title3).foregroundStyle(.white).frame(width: 42, height: 42).background(Circle().fill(Ocean.bubble))
+            VStack(alignment: .leading, spacing: 2) { Text(title).font(.subheadline.weight(.semibold)); Text(text).font(.footnote).foregroundStyle(.secondary) }
+            Spacer(minLength: 0)
+        }
+        .padding(12).background(RoundedRectangle(cornerRadius: 18, style: .continuous).fill(Ocean.card.opacity(0.85)))
+        .accessibilityElement(children: .combine)
     }
 }
 

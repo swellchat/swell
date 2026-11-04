@@ -194,7 +194,7 @@
     <string name="notif_view_once">Foto sekali lihat</string>
     <string name="notif_private">Pesan pribadi baru</string>
     <string name="update_needed">Perlu pembaruan</string>
-    <string name="private_needs_online">Pesan pribadi butuh lawan bicara sedang online.</string>
+    <string name="private_needs_online">Pesan pribadi ini belum bisa dikirim. Coba lagi.</string>
     <string name="view_once_photo">Foto sekali lihat</string>
     <string name="view_once_video">Video sekali lihat</string>
     <string name="view_once_open">Ketuk untuk membuka sekali</string>
@@ -231,4 +231,6 @@
     <string name="tick_read">Dibaca</string>
     <string name="photo_plain">Foto</string>
     <string name="file_plain">Berkas</string>
+    <string name="legal_notice">Swell adalah perangkat lunak bebas berlisensi GNU AGPL-3.0, tanpa jaminan apa pun. Hak cipta PT JIJI LABS DIGITAL dan para pembuat perangkat lunak yang disertakan.</string>
+    <string name="legal_source">Kode sumber dan lisensi</string>
 </resources>

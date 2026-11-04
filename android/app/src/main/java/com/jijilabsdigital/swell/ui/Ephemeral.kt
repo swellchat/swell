@@ -15,6 +15,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.height
@@ -210,13 +211,12 @@ fun ViewOnceViewer(m: StoredMessage, onClose: () -> Unit) {
             Swell.work { Swell.db.message(m.id)?.let { if (it.openedAt > 0) Swell.endViewOnce(it) } }
         }
     }
-    Dialog(onClose, DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false)) {
-        SecureDialogWindow()
+    Dialog(onClose, DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false, securePolicy = androidx.compose.ui.window.SecureFlagPolicy.SecureOn)) {
         Box(Modifier.fillMaxSize().background(Color.Black)) {
             bitmap?.let { Image(it.asImageBitmap(), null, Modifier.fillMaxSize(), contentScale = ContentScale.Fit) }
             if (failed) Text(stringResource(R.string.view_once_opened), Modifier.align(Alignment.Center), color = Color.White)
             Text(
-                stringResource(R.string.view_once_notice), Modifier.align(Alignment.BottomCenter).fillMaxWidth().background(Color(0x99000000)).padding(12.dp),
+                stringResource(R.string.view_once_notice), Modifier.align(Alignment.BottomCenter).fillMaxWidth().background(Color(0x99000000)).navigationBarsPadding().padding(12.dp),
                 color = Color.White, fontSize = 13.sp,
             )
             IconButton(onClose, Modifier.align(Alignment.TopEnd).padding(8.dp).size(48.dp)) {

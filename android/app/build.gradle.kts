@@ -12,7 +12,7 @@ android {
         applicationId = "com.jijilabsdigital.swell"
         minSdk = 26
         targetSdk = 36
-        versionCode = 3
+        versionCode = 5
         versionName = "1.2.0"
         ndk { abiFilters += listOf("arm64-v8a") }
         // Jiji Labs mailbox (onion only). Set after deploy; users can change it in a later version.

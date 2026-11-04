@@ -165,7 +165,8 @@ public enum DemoData {
         l[3].replyTo = l[0].id
         l[4].edited = true; l[4].theirReaction = "\u{2764}\u{FE0F}"
         l[6].deleted = true; l[6].text = ""
-        var v = m(8, "", true, .received); v.fileId = "aa"; v.voiceMs = 14_000; l.append(v)
+        var v = m(8, "", true, .received); v.fileId = "aa"; v.voiceMs = 14_000; v.fileMime = "audio/mp4"; l.append(v)
+        var ph = m(9, "Look at the sea today", true, .received); ph.fileId = "bb"; ph.fileMime = "image/jpeg"; ph.fileName = "photo.jpg"; ph.fileSize = 120_000; l.append(ph)
         return l
     }
 }

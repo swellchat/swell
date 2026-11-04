@@ -1,6 +1,7 @@
 package com.jijilabsdigital.swell.peer
 
 import com.jijilabsdigital.swell.core.Account
+import com.jijilabsdigital.swell.core.Bell
 import com.jijilabsdigital.swell.core.Codec
 import com.jijilabsdigital.swell.core.In
 import com.jijilabsdigital.swell.core.MailboxProtocol
@@ -34,6 +35,10 @@ import kotlin.system.exitProcess
  *   peer invite [--wait S]              print an invite, echo every message back
  *   peer accept <invite> <text> [--wait S]  redeem an invite, send text, print replies
  *
+ * stdin commands for Swell Bell (docs/PROTOCOL.md 6a): `bellkey` sends a fresh BELLKEY to the newest contact,
+ * `bell` listens on our mailbox (op 0x18) and fetches on a match, `bellstop` stops it. Tags are added to PUTs to
+ * contacts that sent us a BELLKEY.
+ *
  * Lines starting with INVITE / CONTACT / RECV / SENT / READY are meant for scripts.
  */
 fun main(args: Array<String>) {
@@ -48,6 +53,7 @@ fun main(args: Array<String>) {
         "last", "mine" -> list.last()
         else -> list.first { it.startsWith(w) }
     }
+    lateinit var kv: com.jijilabsdigital.swell.core.Kv
     val events = object : NodeEvents {
         override fun onReaction(contact: Contact, messageId: String, emoji: String, add: Boolean) =
             println("REACTION ${contact.short} ${messageId.take(8)} $emoji ${if (add) "add" else "remove"}")
@@ -59,6 +65,10 @@ fun main(args: Array<String>) {
         override fun onTyping(contact: Contact, typing: Boolean) = println("TYPING ${contact.short} $typing")
         override fun onAvatar(contact: Contact, jpeg: ByteArray?) = println("AVATAR ${contact.short} ${jpeg?.size ?: "removed"}")
         override fun log(line: String) = println("LOG $line")
+        override fun onBellKey(contact: Contact, key: ByteArray) {
+            kv.put("bell", "out.${contact.id}", key)
+            println("BELLKEY got ${Codec.hex(key).take(8)} from ${contact.short}")
+        }
         override fun onContact(contact: Contact) =
             println("CONTACT ${contact.short} onion=${contact.onion.take(8)}… key=${Codec.hex(contact.identityKey.serialize()).take(16)}")
         override fun onMessage(contact: Contact, message: Message) =
@@ -72,7 +82,7 @@ fun main(args: Array<String>) {
 
     val dataDir = System.getenv("DATA_DIR")?.let { File(it).apply { mkdirs() } }
     val dir = dataDir ?: Files.createTempDirectory("swell-peer").toFile()
-    val kv = if (dataDir != null) FileKv(File(dataDir, "state.bin")) else MemoryKv()
+    kv = if (dataDir != null) FileKv(File(dataDir, "state.bin")) else MemoryKv()
     val account = Account.load(kv) ?: Account.create().also { it.save(kv) }
     val bot = mode == "bot"
     val socksPort = ServerSocket(0).use { it.localPort }
@@ -122,6 +132,14 @@ fun main(args: Array<String>) {
         rotateMs = if (bot) 0 else Node.ROTATE_MS,
     )
     server = InboundServer(node, events).also { it.start() }
+    node.extraCaps = Bell.CAP_BELL
+    // Tag PUTs to contacts that sent a BELLKEY, but only if the mailbox answers BELL (an old one rejects the extra field).
+    val bellMailboxOk = java.util.concurrent.ConcurrentHashMap<String, Boolean>()
+    node.bellKeyOf = { c ->
+        kv.get("bell", "out.${c.id}")?.takeIf { c.peerMailbox.isNotEmpty() && bellMailboxOk.getOrPut(c.peerMailbox) {
+            runCatching { bellAsk(socksPort, c.peerMailbox, -1, 0)?.lost != null }.getOrDefault(false) } }
+    }
+    var bellRun = false
     args.indexOf("--mailbox").takeIf { it >= 0 }?.let { node.mailboxOnion = args[it + 1].removeSuffix(".onion") }
     args.indexOf("--name").takeIf { it >= 0 }?.let { node.profileName = args[it + 1] }
     node.start()
@@ -175,6 +193,32 @@ fun main(args: Array<String>) {
                         println("FILESENT ${f.name} private")
                     }
                     line.startsWith("opened ") -> node.sendOpened(node.contacts().last(), pick(line.removePrefix("opened "), incomingIds))
+                    line == "bellkey" -> node.contacts().last().let { c ->
+                        val key = Bell.newKey()
+                        kv.put("bell", "in.${c.id}", key)
+                        node.sendBellKey(c, key)
+                        println("BELLKEY sent ${Codec.hex(key).take(8)} to ${c.short}")
+                    }
+                    line == "bell" -> if (!bellRun) {
+                        bellRun = true
+                        thread(isDaemon = true, name = "bell") {
+                            var cursor = -1L
+                            while (bellRun) {
+                                val r = runCatching { bellAsk(socksPort, node.mailboxOnion, cursor, 25_000) }.onFailure { println("LOG bell: ${it.message}"); Thread.sleep(3_000) }.getOrNull() ?: continue
+                                val keys = kv.list("bell").filter { it.first.startsWith("in.") }.map { it.first.removePrefix("in.") to it.second }
+                                var hits = 0
+                                r.tags.forEach { t ->
+                                    keys.filter { Bell.matches(it.second, t) }.forEach { (id, _) ->
+                                        hits++; println("BELLHIT ${node.contacts().firstOrNull { it.id == id }?.short ?: id.take(8)}")
+                                    }
+                                }
+                                if (cursor == -1L || r.tags.isNotEmpty() || r.lost) println("BELL cursor=${r.cursor} tags=${r.tags.size} lost=${if (r.lost) 1 else 0} hits=$hits")
+                                cursor = r.cursor
+                                if (hits > 0 || r.lost) runCatching { println("POLLED ${node.pollMailbox()}") }.onFailure { println("LOG bell fetch: ${it.message}") }
+                            }
+                        }
+                    }
+                    line == "bellstop" -> bellRun = false
                     line == "poll" -> println("POLLED ${node.pollMailbox()}")
                     line.startsWith("file ") -> {
                         val f = File(line.removePrefix("file "))
@@ -227,6 +271,18 @@ fun main(args: Array<String>) {
     if (dataDir == null) dir.deleteRecursively()
     exitProcess(0)
 }
+
+private class BellAnswer(val cursor: Long, val lost: Boolean, val tags: List<ByteArray>)
+
+/** One BELL request to [mailbox] over its own Tor stream; null if the mailbox refuses (older than 1.3). */
+private fun bellAsk(socksPort: Int, mailbox: String, cursor: Long, waitMs: Int): BellAnswer? =
+    Socks5.connect(socksPort, "${mailbox.removeSuffix(".onion")}.onion", Node.PORT, isolation = "bell").use { s ->
+        com.jijilabsdigital.swell.core.Wire.write(s.getOutputStream(), Out().u8(MailboxProtocol.VERSION).u8(MailboxProtocol.BELL).i64(cursor).i32(waitMs).done())
+        val r = In(com.jijilabsdigital.swell.core.Wire.read(s, 40_000))
+        if (r.u8() != MailboxProtocol.R_BELL) return null
+        val c = r.i64(); val lost = r.u8() == 1
+        BellAnswer(c, lost, List(r.i32()) { r.raw(Bell.TAG_SIZE) })
+    }
 
 /** Defers to a [TorControlHost] built once the inbound server's port is known. */
 private class HostProxy(val ctl: TorControlConnection, val port: () -> Int) : OnionHost {

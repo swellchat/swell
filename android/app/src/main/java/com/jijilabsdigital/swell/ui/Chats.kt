@@ -657,8 +657,8 @@ private fun rememberSaver(m: StoredMessage): () -> Unit {
 @Composable
 private fun PhotoViewer(m: StoredMessage, onClose: () -> Unit) {
     val save = rememberSaver(m)
-    androidx.compose.ui.window.Dialog(onClose, androidx.compose.ui.window.DialogProperties(usePlatformDefaultWidth = false)) {
-        if (m.isPrivate) SecureDialogWindow()
+    androidx.compose.ui.window.Dialog(onClose, androidx.compose.ui.window.DialogProperties(usePlatformDefaultWidth = false,
+        securePolicy = if (m.isPrivate) androidx.compose.ui.window.SecureFlagPolicy.SecureOn else androidx.compose.ui.window.SecureFlagPolicy.Inherit)) {
         Box(Modifier.fillMaxSize().background(Color.Black)) {
             Thumb(m, 2048, Modifier.fillMaxSize())
             Row(Modifier.align(Alignment.TopEnd).padding(8.dp)) {

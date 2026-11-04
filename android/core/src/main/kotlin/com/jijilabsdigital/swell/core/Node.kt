@@ -162,6 +162,8 @@ class Attachment(val id: String, val name: String, val mime: String, val size: L
 interface NodeEvents {
     fun log(line: String) {}
     fun onContact(contact: Contact) {}
+    /** The contact sent a BELLKEY: tag our PUTs into their queue with it (PROTOCOL.md 6a). */
+    fun onBellKey(contact: Contact, key: ByteArray) {}
     /** Called inside the storage transaction that also advanced the ratchet; store the message here. */
     fun onMessage(contact: Contact, message: Message) {}
     /** Someone redeemed one of our invites. The app should ask the user to check the safety number. */
@@ -271,6 +273,17 @@ class Node(
     private val ramKv = MemoryKv()
     private val background = Executors.newSingleThreadScheduledExecutor { r -> Thread(r, "swell-node").apply { isDaemon = true } }
 
+    /** Opt-in capability bits a host adds to [CAPS] (the Mac test peer sets [Bell.CAP_BELL]; the Android app leaves this 0). Set before [start]. */
+    @Volatile var extraCaps: Int = 0
+    /** Swell Bell, opt-in: the bell key of the contact we send to; when non-null for a contact, mailbox PUTs carry a 12-byte tag made with it. */
+    @Volatile var bellKeyOf: ((Contact) -> ByteArray?)? = null
+
+    /** Sends BELLKEY: the key the contact must use to tag its PUTs into our queue (only to contacts with [Bell.CAP_BELL]). */
+    fun sendBellKey(c: Contact, key: ByteArray) {
+        if (c.caps and Bell.CAP_BELL == 0) throw IOException("Update needed")
+        send(c, Out().u8(Bell.INNER_BELLKEY).raw(key).done())
+    }
+
     private class OnionEntry(val onion: String, val key: String, val created: Long, var retireAt: Long)
     private var onions = mutableListOf<OnionEntry>()
     private var published = emptySet<String>()
@@ -326,9 +339,9 @@ class Node(
         }
         onion = onions.last().onion
         // An app update that brings new features tells every contact (their apps learn the new caps from STATE).
-        if (kv.get(NS_ACCT, "caps")?.let { In(it).i32() } != CAPS) {
+        if (kv.get(NS_ACCT, "caps")?.let { In(it).i32() } != (CAPS or extraCaps)) {
             contacts.values.forEach { it.upgraded = true }
-            kv.put(NS_ACCT, "caps", Out().i32(CAPS).done())
+            kv.put(NS_ACCT, "caps", Out().i32(CAPS or extraCaps).done())
         }
         val upgraded = contacts.values.filter { it.upgraded }
         upgraded.forEach { it.upgraded = false; save(it) }
@@ -599,7 +612,7 @@ class Node(
         val ct = synchronized(lock) {
             SessionBuilder(store, contact.address).process(bundle)
             val hello = Out().u8(I_HELLO).str(onion).str(profileName).also { writeMailbox(it, contact) }.bytes(contact.myAuth)
-                .also { writeMsg(it, msg) }.i32(CAPS).done()
+                .also { writeMsg(it, msg) }.i32(CAPS or extraCaps).done()
             SessionCipher(store, contact.address).encrypt(Padding.pad(hello))
         }
         val ok = try {
@@ -665,7 +678,7 @@ class Node(
             val ct = synchronized(lock) {
                 SessionBuilder(store, contact.address).process(bundle)
                 val hello = Out().u8(I_HELLO).str(onion).str(profileName).also { writeMailbox(it, contact) }.bytes(contact.myAuth)
-                    .also { writeMsg(it, msg) }.i32(CAPS).done()
+                    .also { writeMsg(it, msg) }.i32(CAPS or extraCaps).done()
                 SessionCipher(store, contact.address).encrypt(Padding.pad(hello))
             }
             // The HELLO is a normal peer frame; its secret is the seal key, which proves we read the invite.
@@ -731,7 +744,7 @@ class Node(
             if (m.replyTo != null || ext) it.bytes(replyBytes(m.replyTo))
             if (ext) it.u8(fl).i32(timerSec)
             if (pv != null) it.bytes(pv.encode())
-        }.done(), useMailbox = fl and FLAG_PRIVATE == 0, directAttempts = if (fl and FLAG_PRIVATE != 0) 2 else 6)
+        }.done())
         events.onMessage(c, m)
         return m
     }
@@ -747,7 +760,7 @@ class Node(
         val fl = if (flags and FLAG_VIEW_ONCE != 0 && !(mime.startsWith("image/") || mime.startsWith("video/"))) flags and FLAG_VIEW_ONCE.inv() else flags
         checkFeatures(c, fl, timerSec)
         // The contact may have restarted and lost the mode: say it again, so parts go to its RAM, not its disk.
-        if (priv) send(c, Out().u8(I_CONTROL).u8(CONTROL_ON).done(), useMailbox = false, directAttempts = 2)
+        if (priv) send(c, Out().u8(I_CONTROL).u8(CONTROL_ON).done())
         val fileId = Codec.random(16)
         // The first part is small (it fits a mailbox). If it went directly, the rest go in big parts:
         // each part costs one Tor round trip, so fewer parts is much faster.
@@ -757,7 +770,7 @@ class Node(
         while (off < data.size) {
             val size = if (i == 0 || !direct) PART_SIZE else BIG_PART_SIZE
             val chunk = data.copyOfRange(off, minOf(data.size, off + size))
-            val wasDirect = send(c, Out().u8(I_FILE_PART).raw(fileId).i32(i).bytes(chunk).done(), useMailbox = size == PART_SIZE && !priv, directAttempts = if (priv) 2 else 6)
+            val wasDirect = send(c, Out().u8(I_FILE_PART).raw(fileId).i32(i).bytes(chunk).done(), useMailbox = size == PART_SIZE)
             if (i == 0) direct = wasDirect
             if (!direct && data.size > MAX_OFFLINE_FILE) {
                 throw IOException("The contact is offline. Files over ${MAX_OFFLINE_FILE / 1_000_000.0} MB can only be sent while they are online.")
@@ -775,7 +788,7 @@ class Node(
             .raw(sha256(data)).i32(parts).also {
                 if (extras) it.bytes(replyBytes(m.replyTo)).i32(m.durationMs)
                 if (ext) it.u8(fl).i32(timerSec)
-            }.done(), useMailbox = !priv, directAttempts = if (priv) 2 else 6)
+            }.done())
         progress(100)
         events.onMessage(c, m)
         return m
@@ -913,19 +926,19 @@ class Node(
     fun setPrivateMode(c: Contact, on: Boolean) {
         if (on) {
             if (!c.supportsPrivate) throw IOException("Update needed")
-            send(c, Out().u8(I_CONTROL).u8(CONTROL_ON).done(), useMailbox = false, directAttempts = 2)
+            send(c, Out().u8(I_CONTROL).u8(CONTROL_ON).done())
             privateChats += c.id
         } else {
             val was = privateChats.remove(c.id)
             clearPrivateRam(c)
-            if (was && c.supportsPrivate) runCatching { send(c, Out().u8(I_CONTROL).u8(CONTROL_OFF).done(), useMailbox = false, directAttempts = 1) }
+            if (was && c.supportsPrivate) runCatching { send(c, Out().u8(I_CONTROL).u8(CONTROL_OFF).done(), directAttempts = 1) }
         }
     }
 
     /** Tells the contact to wipe the chat's private messages (we wiped ours). Best effort, direct only. */
     fun sendWipe(c: Contact) {
         if (c.id !in privateChats || !c.supportsPrivate || c.blocked) return
-        runCatching { send(c, Out().u8(I_CONTROL).u8(CONTROL_WIPE).done(), useMailbox = false, directAttempts = 1) }
+        runCatching { send(c, Out().u8(I_CONTROL).u8(CONTROL_WIPE).done(), directAttempts = 1) }
     }
 
     /**
@@ -955,7 +968,7 @@ class Node(
     fun sendProfile(c: Contact) = sendState(c)
 
     private fun stateInner(c: Contact) =
-        Out().u8(I_STATE).str(profileName).also { writeMailbox(it, c) }.str(onion).bytes(c.myAuth).i32(CAPS).done()
+        Out().u8(I_STATE).str(profileName).also { writeMailbox(it, c) }.str(onion).bytes(c.myAuth).i32(CAPS or extraCaps).done()
 
     private fun readState(r: In, c: Contact) {
         val n = cleanName(r.str(256))
@@ -1073,7 +1086,9 @@ class Node(
             throw e ?: IOException("Message refused.")
         }
         events.log("contact offline, leaving message in mailbox")
-        val put = Out().u8(MailboxProtocol.VERSION).u8(MailboxProtocol.PUT).raw(c.peerQueue).bytes(f).done()
+        val bellKey = bellKeyOf?.invoke(c)
+        val put = Out().u8(MailboxProtocol.VERSION).u8(MailboxProtocol.PUT).raw(c.peerQueue).bytes(f)
+            .also { if (bellKey != null) it.bytes(Bell.tag(bellKey)) }.done()
         if (In(request(c.peerMailbox, put, attempts = 3, isolation = Codec.hex(Codec.random(8)))).u8() != MailboxProtocol.R_OK) {
             throw IOException("The contact's mailbox is full.")
         }
@@ -1346,12 +1361,9 @@ class Node(
                     I_TEXT -> {
                         val m = readMsg(ir, contact); val reply = readReplyTo(ir); val (fl, tm) = readExt(ir, textOnly = true)
                         val pv = readPreview(ir, m.text)
-                        // Private messages never travel through the mailbox; a copy from there is not ours to show.
-                        if (fl and FLAG_PRIVATE != 0 && fromMailbox) events.log("private message from mailbox dropped")
-                        else {
-                            if (fl and FLAG_PRIVATE != 0) enterPrivate(contact)
-                            events.onMessage(contact, m.copy(replyTo = reply, flags = fl, timerSec = tm, preview = if (fl and FLAG_PRIVATE == 0) pv else null))
-                        }
+                        // Private messages may arrive through the mailbox too (an iPhone has no direct route); the app keeps them in RAM.
+                        if (fl and FLAG_PRIVATE != 0) enterPrivate(contact)
+                        events.onMessage(contact, m.copy(replyTo = reply, flags = fl, timerSec = tm, preview = if (fl and FLAG_PRIVATE == 0) pv else null))
                     }
                     I_SETTINGS -> { contact.expireSec = ir.i32().coerceIn(0, 365 * 86400); save(contact) }
                     I_STATE -> { readState(ir, contact); save(contact); reauth = true }
@@ -1399,10 +1411,10 @@ class Node(
                         else if (!allowInbound(contact, ephemeral = true)) events.log("avatar dropped: rate limit")
                         else events.onAvatar(contact, jpeg.takeIf { it.isNotEmpty() })
                     }
+                    Bell.INNER_BELLKEY -> events.onBellKey(contact, ir.raw(Bell.KEY_SIZE))
                     I_CONTROL -> {
                         val op = ir.u8()
-                        // Direct path only: a copy from the mailbox is stale, and a wipe must not outlive the moment.
-                        if (!fromMailbox && allowInbound(contact, ephemeral = true)) when (op) {
+                        if (allowInbound(contact, ephemeral = true)) when (op) {
                             CONTROL_ON -> enterPrivate(contact)
                             CONTROL_OFF -> { if (privateChats.remove(contact.id)) { clearPrivateRam(contact); events.onControl(contact, CONTROL_OFF) } }
                             CONTROL_WIPE -> { clearPrivateRam(contact); events.onControl(contact, CONTROL_WIPE) }

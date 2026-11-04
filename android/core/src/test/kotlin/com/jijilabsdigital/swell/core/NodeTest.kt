@@ -900,18 +900,29 @@ class NodeTest {
     }
 
     @Test
-    fun privateMessagesNeverGoThroughTheMailbox() {
+    fun privateMessagesAndControlAlsoTravelThroughTheMailbox() {
         val a = Peer("privmaila", mailbox = true); val b = Peer("privmailb", mailbox = true)
         val bobsAlice = b.node.acceptInvite(a.node.createInvite(), "hi")
         waitFor { a.node.contacts().singleOrNull()?.supportsPrivate == true && bobsAlice.supportsPrivate && bobsAlice.peerMailbox.isNotEmpty() }
         val c = a.node.contacts().single()
-        a.stop() // alice is offline; her mailbox exists
-        val ordinary = mailboxStore
-        assertFailsWith<IOException> { b.node.setPrivateMode(bobsAlice, true) }
-        assertFailsWith<IOException> { b.node.sendText(bobsAlice, "secret", flags = Node.FLAG_PRIVATE) }
-        // An ordinary message still falls back to the mailbox.
-        b.node.sendText(bobsAlice, "ordinary")
-        assertTrue(ordinary.list(Codec.hex(MailboxProtocol.queueId(c.myQueueSecret)), 10).size >= 1)
+        val q = Codec.hex(MailboxProtocol.queueId(c.myQueueSecret))
+        a.stop() // alice is offline; her mailbox holds what bob sends
+        b.node.setPrivateMode(bobsAlice, true)
+        b.node.sendText(bobsAlice, "private while offline", flags = Node.FLAG_PRIVATE)
+        assertEquals(2, mailboxStore.list(q, 10).size, "CONTROL and the private message wait in the mailbox")
+        // Alice comes back (same storage) and polls the mailbox: the message arrives flagged private and the mode turns on.
+        val a2 = Peer("privmaila", a.kv, a.account, mailbox = true)
+        a2.node.pollMailbox()
+        waitFor { a2.rec.msgs.any { it.isPrivate } }
+        assertTrue(a2.rec.msgs.single { it.isPrivate }.text == "private while offline")
+        assertTrue(a2.rec.controls.contains(Node.CONTROL_ON))
+        // A wipe through the mailbox works too.
+        a2.stop()
+        b.node.sendWipe(bobsAlice)
+        val a3 = Peer("privmaila", a.kv, a.account, mailbox = true)
+        a3.node.pollMailbox()
+        waitFor { a3.rec.controls.contains(Node.CONTROL_WIPE) }
+        assertTrue(a3.rec.controls.contains(Node.CONTROL_WIPE))
     }
 }
 

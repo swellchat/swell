@@ -145,8 +145,8 @@ All of this is backwards compatible in the same way as 5a: a reader ignores unkn
 - The composer offers Off / 10 s / 1 min / 1 h / 1 day.
 
 **Private mode (per chat).**
-- `CONTROL` (type 14): `u8 op`. `1` = private mode on, `2` = off, `3` = wipe. Sent only to contacts with `CAP_PRIVATE_MODE`, **direct path only, never the mailbox** (a receiver drops a copy that arrives from the mailbox). Unknown `op` is ignored. The same rate bucket as TYPING applies.
-- A message with `flags` bit 1 is a private message. Private messages are also **direct only**: if the contact is offline the send fails ("Private messages need the other person online") and nothing is queued anywhere.
+- `CONTROL` (type 14): `u8 op`. `1` = private mode on, `2` = off, `3` = wipe. Sent only to contacts with `CAP_PRIVATE_MODE`. **Like any message: direct first, the mailbox as the fallback**, and a receiver accepts CONTROL from either path (an iPhone has no direct route, so for it the mailbox is the only one). A CONTROL that arrives late (from the mailbox) is still applied: `op 3` and `op 2` wipe whatever private messages are in RAM at that moment. Unknown `op` is ignored. The same rate bucket as TYPING applies.
+- A message with `flags` bit 1 is a private message. Private messages take the same two paths. While the contact is offline the (still end-to-end encrypted) envelope waits in their mailbox queue, as for any message (at most 14 days, deleted when fetched and acknowledged); the receiver accepts a private message from the mailbox and keeps it in RAM only, exactly as if it had arrived direct. File parts above 48 KiB are direct only, as for any file, so a large private photo needs the contact online. The send fails only if neither path works.
 - The receiver keeps private messages (text, photos, voice, file parts and the decrypted media) **in RAM only**: never in the database, files, cache, search index, backups, the chat-list preview or a notification. File parts of a contact that is in private mode are also held in RAM until the FILE arrives. The notification text is "New private message", with no sender and no content.
 - Both sides show the banner "Private mode · nothing is saved" and a distinct darker look, and block screenshots while it is on.
 - `op 1` from the contact puts our side in private mode too (the mode is shared by the chat); a private message that arrives while we are not in the mode (we missed op 1, or restarted) turns it on and is kept in RAM.
@@ -188,6 +188,42 @@ Frames start with `u8 VERSION=2 | u8 op`. Queue id = `SHA-256("swell-queue" || s
 **Foreground clients (iOS, Android)** keep one stream open to the mailbox and loop WAIT (25 s) on it, using the same stream for PUT/ACK; on `0xFF` for 0x17 (older server) they fall back to polling GET every 12 s. Both ops are new in mailbox 1.1 (64 queues per WAIT: 1.2); an old server answers `0xFF` to them.
 
 **Client polling rule:** fetch one queue per request, each over its own Tor circuit (SOCKS username = random isolation tag).
+
+## 6a. Swell Bell (mailbox 1.3; caps bit 16)
+
+Design and reasons: `DESIGN-SWELL-BELL.md`. A listener names no queue: it reads one public log of 12-byte tags and checks them against its own bell keys. Servers older than 1.3 answer `0xFF` to op 0x18 and to a PUT with a trailing tag.
+
+**Capability and key.** `CAP_BELL = 65536` (bit 16, `1 << 16`) in the `caps` of HELLO/STATE. Inner type **15 BELLKEY** (inside the ratchet, any path): `raw32 key`. The *receiver* of a queue generates a random `bellKey` per contact and sends it to that contact; the contact (the sender) uses it to tag PUTs into the receiver's queue. A new BELLKEY replaces the old one (send it again when the queue rotates). A reader ignores trailing bytes; a reader that lacks the cap ignores the type (answers `R_OK`). Send BELLKEY only to contacts with `CAP_BELL`.
+
+**Tag (12 bytes).** `tag = nonce(4) || HMAC-SHA256(bellKey, nonce)[0..8]`, `nonce` = 4 random bytes. **Match:** for a tag `t` and a key `k`, `t[4..12] == HMAC-SHA256(k, t[0..4])[0..8]` (compare in constant time). A tag may be replayed by anyone who saw it; the cost is one useless fetch, so a client must treat a match only as "fetch that queue".
+
+**Test vectors** (hex):
+
+| bellKey | nonce | tag |
+|---------|-------|-----|
+| `000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f` | `00000000` | `00000000a86acbcbc29b8fa8` |
+| `000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f` | `01020304` | `01020304e3ba74ad60769167` |
+| `4242424242424242424242424242424242424242424242424242424242424242` | `deadbeef` | `deadbeef2759079ac61b2bf6` |
+
+The first tag does not match the key `4242...42`; the second does not match if its last byte is changed.
+
+**PUT with a tag (op 0x11, optional trailing field).** `raw32 queueId, bytes envelope, bytes bell`. `bell` must be exactly 12 bytes; any other length, or any other trailing byte, rejects the whole frame (`0xFF`) and stores nothing. The server stores the envelope first; only when that succeeded it appends the tag to the log, then answers `0x80`. If the PUT fails (no such queue, full) no tag is logged. A PUT without `bell` works exactly as before and logs nothing. Send `bell` only to a mailbox that has answered op 0x18 (a successful BELL request) in this session or earlier; old servers reject the trailing field.
+
+**Op 0x18 BELL.** Frame: `u8 2, u8 0x18, i64 cursor, i32 maxWaitMs`. No authentication, no queue, no secret.
+Answer: `u8 0x84, i64 newCursor, u8 lost, i32 n, raw12 x n`.
+
+- A cursor is the number of the next tag to read; the first tag ever logged is number 0, numbers only grow, and they survive server restarts (the log is stored on disk).
+- `cursor = -1` means "from now": answered at once with `n = 0`, `newCursor` = the current end of the log. Store `newCursor` and use it in the next request.
+- `cursor == end of log`: the server parks the request for up to `maxWaitMs` (clamped to 0..25000) and answers as soon as new tags are published, or with `n = 0` and the same cursor at the timeout. Loop immediately after every answer.
+- **Publishing is batched.** The server publishes new tags to listeners at most every 100 ms (trailing edge: a PUT starts a 100 ms timer; tags appended before it fires go out together). So one message reaches listeners 0 to 100 ms after the PUT, and a burst wakes a listener once.
+- `n` is at most 2048 per answer (24,576 bytes). If more are waiting, `newCursor = cursor + n` and the next request is answered at once.
+- All listeners with the same `cursor` receive identical bytes.
+- `cursor` older than the oldest kept tag, or **newer than the end of the log** (the server lost its log): `lost = 1, n = 0, newCursor` = end of log. The client must then fetch every queue once (staggered, as in the design) and continue from `newCursor`.
+- Otherwise `lost = 0`. `cursor < -1`, a malformed frame or a server at its listener cap (default 5,000 parked BELL requests) answers `0xFF`; on a cap `0xFF` the client waits a random 5 to 30 s before retrying, or falls back to lanes.
+- Retention: tags are kept up to 14 days and at most `MAILBOX_BELL_MAX_MB` (default 192 MiB, about 16.7 million tags, because a tag takes 12 bytes on disk). The oldest 3 MiB segments are dropped first.
+- Privacy: the server keeps no per-listener state besides the open socket, logs no cursor, and the log has no queue ids. A listener that reconnects with the cursor it was last given shares that cursor with every listener that is up to date, because answers end only at publish points.
+
+**Mac test peer** (`android/peer`): sends BELLKEY on request and tags PUTs; stdin commands `bellkey` (send a fresh BELLKEY to the newest contact), `bell` (listen on our own mailbox with op 0x18) and `bellstop`. The peer announces `CAP_BELL`. It tags a PUT only if it holds a BELLKEY from that contact and the contact's mailbox answered a BELL probe. Output lines: `BELLKEY sent <8 hex> to <contact>`, `BELLKEY got <8 hex> from <contact>`, `BELL cursor=<n> tags=<n> lost=<0|1> hits=<n>` (first answer, and every answer with tags or `lost`), `BELLHIT <contact>`; after a hit or `lost` it fetches with `POLLED <n>`.
 
 ## 7. Onion client authorization
 

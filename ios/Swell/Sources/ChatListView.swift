@@ -76,7 +76,28 @@ struct ChatListView: View {
                     }
                 }.padding(.vertical, 4)
             }.listRowBackground(Ocean.background).listRowSeparatorTint(Ocean.hairline)
-            ForEach(model.contacts) { c in
+            ForEach(listed) { c in row(c) }
+            if archivedCount > 0 {
+                NavigationLink { ArchivedChats() } label: {
+                    Label("Archived chats (\(archivedCount))", systemImage: "archivebox").font(.subheadline).foregroundStyle(.secondary).padding(.vertical, 6)
+                }.listRowBackground(Ocean.background).listRowSeparator(.hidden)
+            }
+        }
+        .listStyle(.plain)
+        .scrollContentBackground(.hidden)
+    }
+
+    private var listed: [Contact] {
+        model.contacts.filter { (model.flags[$0.id] ?? 0) & 2 == 0 }.sorted { a, b in
+            let pa = (model.flags[a.id] ?? 0) & 1, pb = (model.flags[b.id] ?? 0) & 1
+            return pa != pb ? pa > pb : a.lastAt > b.lastAt
+        }
+    }
+    private var archivedCount: Int { model.contacts.filter { (model.flags[$0.id] ?? 0) & 2 != 0 }.count }
+
+    @ViewBuilder fileprivate func row(_ c: Contact) -> some View {
+        let f = model.flags[c.id] ?? 0
+        Group {
                 NavigationLink(value: c.id) {
                     HStack(spacing: 14) {
                         Avatar(name: c.displayName, size: 50, photo: model.avatars[c.id])
@@ -94,6 +115,7 @@ struct ChatListView: View {
                                 Text(c.waiting ? "Waiting for them to accept…" : c.lastText.isEmpty ? "No messages yet" : c.lastText)
                                     .font(.subheadline).foregroundStyle(.secondary).lineLimit(2)
                                 Spacer(minLength: 0)
+                                if c.unread == 0 && f & 4 != 0 { Circle().fill(Ocean.bubble).frame(width: 12, height: 12).accessibilityLabel("Marked unread") }
                                 if c.unread > 0 {
                                     Text("\(c.unread)").font(.caption.weight(.semibold)).foregroundStyle(Ocean.onAccent)
                                         .padding(.horizontal, 7).padding(.vertical, 2).background(Capsule().fill(Ocean.bubble))
@@ -104,17 +126,37 @@ struct ChatListView: View {
                 }
                 .swipeActions(edge: .trailing, allowsFullSwipe: false) {
                     Button(role: .destructive) { toDelete = c.id } label: { Label("Delete", systemImage: "trash") }
+                    Button { model.setFlag(c.id, 2, f & 2 == 0) } label: { Label(f & 2 == 0 ? "Archive" : "Unarchive", systemImage: "archivebox") }.tint(.indigo)
                     Button { model.setBlocked(c.id, !c.blocked) } label: { Label(c.blocked ? "Unblock" : "Block", systemImage: "nosign") }.tint(.orange)
                 }
                 .swipeActions(edge: .leading) {
-                    Button { model.setVerified(c.id, !c.verified) } label: { Label(c.verified ? "Unverify" : "Verify", systemImage: "checkmark.seal") }.tint(Ocean.accent)
+                    Button { model.setFlag(c.id, 1, f & 1 == 0) } label: { Label(f & 1 == 0 ? "Pin" : "Unpin", systemImage: f & 1 == 0 ? "pin" : "pin.slash") }.tint(Ocean.accent)
+                    Button { model.setFlag(c.id, 4, f & 4 == 0) } label: { Label(f & 4 == 0 ? "Mark unread" : "Mark read", systemImage: "envelope.badge") }.tint(.teal)
+                }
+                .contextMenu {
+                    Button { model.setFlag(c.id, 1, f & 1 == 0) } label: { Label(f & 1 == 0 ? "Pin" : "Unpin", systemImage: "pin") }
+                    Button { model.setFlag(c.id, 4, f & 4 == 0) } label: { Label(f & 4 == 0 ? "Mark unread" : "Mark read", systemImage: "envelope.badge") }
+                    Button { model.setFlag(c.id, 2, f & 2 == 0) } label: { Label(f & 2 == 0 ? "Archive" : "Unarchive", systemImage: "archivebox") }
+                    Button { model.setVerified(c.id, !c.verified) } label: { Label(c.verified ? "Unverify" : "Verify", systemImage: "checkmark.seal") }
                 }
                 .listRowBackground(Ocean.background)
                 .listRowSeparatorTint(Ocean.hairline)
-            }
         }
-        .listStyle(.plain)
-        .scrollContentBackground(.hidden)
+    }
+}
+
+struct ArchivedChats: View {
+    @EnvironmentObject var model: AppModel
+    var body: some View {
+        List {
+            ForEach(model.contacts.filter { (model.flags[$0.id] ?? 0) & 2 != 0 }) { c in
+                NavigationLink(value: c.id) {
+                    HStack(spacing: 14) { Avatar(name: c.displayName, size: 44, photo: model.avatars[c.id]); Text(c.displayName).font(.headline) }
+                }
+                .swipeActions { Button { model.setFlag(c.id, 2, false) } label: { Label("Unarchive", systemImage: "archivebox") }.tint(.indigo) }
+                .listRowBackground(Ocean.background)
+            }
+        }.listStyle(.plain).scrollContentBackground(.hidden).background(Ocean.background).navigationTitle("Archived")
     }
 }
 
@@ -122,16 +164,20 @@ private struct EmptyChats: View {
     let add: () -> Void
     let invite: () -> Void
     var body: some View {
-        VStack(spacing: 14) {
-            Spacer()
-            BrandMark(size: 96)
-            Text("No chats yet").font(.title2.bold())
-            Text("Invite a friend to chat. They get a link, tap it, and you are connected.")
-                .font(.subheadline).foregroundStyle(.secondary).multilineTextAlignment(.center)
-            Button(action: invite) { Label("Invite a friend", systemImage: "person.badge.plus") }.buttonStyle(PrimaryButton()).padding(.top, 8)
-            Button("I have a link or code", action: add).buttonStyle(SecondaryButton())
-            Spacer()
-        }.padding(.horizontal, 32)
+        ZStack {
+            WaveBackdrop().ignoresSafeArea()
+            VStack(spacing: 16) {
+                Spacer()
+                BrandMark(size: 92)
+                Text("Your chats will live here").font(.title2.bold())
+                Text("Invite a friend with a link. When they open it, you are connected, with no phone number or sign-up.")
+                    .font(.subheadline).foregroundStyle(.secondary).multilineTextAlignment(.center)
+                Button(action: invite) { Label("Invite a friend", systemImage: "person.badge.plus").font(.title3.weight(.semibold)) }
+                    .buttonStyle(PrimaryButton()).padding(.top, 6)
+                Button("I have a link or code", action: add).buttonStyle(SecondaryButton())
+                Spacer()
+            }.padding(.horizontal, 32)
+        }
     }
 }
 
@@ -241,101 +287,6 @@ struct MyCodeSheet: View {
             .navigationTitle("Invite a friend").navigationBarTitleDisplayMode(.inline)
             .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Close") { dismiss() } } }
             .task { load() }
-        }
-        .presentationBackground(.ultraThinMaterial)
-    }
-}
-
-private struct SettingsSheet: View {
-    @EnvironmentObject var model: AppModel
-    @Environment(\.dismiss) private var dismiss
-    @State private var confirm = false
-    @State private var working = false
-    @State private var showTerms = false
-    @State private var showCode = false
-    @State private var name = ""
-    @State private var pick: PhotosPickerItem?
-
-    var body: some View {
-        NavigationStack {
-            List {
-                Section {
-                    HStack(spacing: 14) {
-                        PhotosPicker(selection: $pick, matching: .images) {
-                            ZStack(alignment: .bottomTrailing) {
-                                Avatar(name: model.name.isEmpty ? "?" : model.name, size: 60, photo: model.myPhoto)
-                                Image(systemName: "camera.circle.fill").symbolRenderingMode(.palette).foregroundStyle(.white, Ocean.accent).font(.title3)
-                            }
-                        }.accessibilityLabel("Change profile photo")
-                        TextField("Your name", text: $name).font(.headline).submitLabel(.done).onSubmit { model.setName(name) }
-                    }.padding(.vertical, 4)
-                    if model.myPhoto != nil { Button("Remove photo", role: .destructive) { model.setPhoto(nil) } }
-                } header: { Text("You") } footer: { Text("Your name and photo are shared only with your contacts.") }
-                .listRowBackground(Ocean.card)
-                Section {
-                    Button { showCode = true } label: { Label("Invite a friend", systemImage: "person.badge.plus") }
-                } .listRowBackground(Ocean.card)
-                Section {
-                    Toggle("Delivery and read receipts", isOn: $model.receipts)
-                    Toggle("Typing indicator", isOn: $model.typing)
-                } header: { Text("Privacy") } footer: { Text("When these are off, you neither send nor see them. They work only with contacts who turned them on too.") }
-                .listRowBackground(Ocean.card)
-                Section {
-                    Label("Messages are end-to-end encrypted and routed privately, so your location stays hidden.", systemImage: "lock.fill")
-                    Label("This iPhone receives while Swell is open. Messages wait in your mailbox for up to 14 days.", systemImage: "tray")
-                } header: { Text("How it works") }
-                .font(.subheadline).listRowBackground(Ocean.card)
-                Section {
-                    let blocked = model.contacts.filter { $0.blocked }
-                    if blocked.isEmpty { Text("No blocked contacts").font(.subheadline).foregroundStyle(.secondary) }
-                    ForEach(blocked) { c in
-                        HStack {
-                            Avatar(name: c.displayName, size: 32, photo: model.avatars[c.id])
-                            Text(c.displayName).font(.body)
-                            Spacer()
-                            Button("Unblock") { model.setBlocked(c.id, false) }.font(.subheadline.weight(.medium))
-                        }
-                    }
-                } header: { Text("Blocked") } footer: { Text("Messages from blocked contacts are dropped without a notice.") }
-                .listRowBackground(Ocean.card)
-                Section {
-                    Link(destination: URL(string: "mailto:support@jijilabsdigital.com")!) { Label("Contact Jiji Labs", systemImage: "envelope") }
-                    Button { showTerms = true } label: { Label("Terms of Use", systemImage: "doc.text") }
-                } header: { Text("Support") }
-                .listRowBackground(Ocean.card)
-                Section {
-                    LabeledContent("Network", value: model.network).font(.subheadline)
-                } header: { Text("About") } footer: { Text("Technical detail for the curious. Swell routes messages through the Tor network.") }
-                .listRowBackground(Ocean.card)
-                Section {
-                    Button(role: .destructive) { confirm = true } label: { Text(working ? "Deleting…" : "Delete account") }.disabled(working)
-                    if let p = model.problem { Text(p).font(.footnote).foregroundStyle(.red) }
-                } footer: { Text("Erases your contacts, messages and keys from this iPhone.") }
-                .listRowBackground(Ocean.card)
-            }
-            .listStyle(.insetGrouped)
-            .scrollContentBackground(.hidden).background(Ocean.background)
-            .navigationTitle("Settings").navigationBarTitleDisplayMode(.large)
-            .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { model.setName(name); dismiss() }.disabled(working) } }
-            .interactiveDismissDisabled(working)
-            .onAppear { name = model.name }
-            .onChange(of: pick) { _, item in
-                guard let item else { return }
-                Task {
-                    if let d = try? await item.loadTransferable(type: Data.self), let img = UIImage(data: d) { model.setPhoto(img) }
-                    pick = nil
-                }
-            }
-            .sheet(isPresented: $showTerms) { TermsSheet() }
-            .sheet(isPresented: $showCode) { MyCodeSheet() }
-            .confirmationDialog("Delete your account?", isPresented: $confirm, titleVisibility: .visible) {
-                Button("Delete account", role: .destructive) {
-                    working = true
-                    Task { let ok = await model.deleteAccount(); working = false; if ok { dismiss() } }
-                }
-            } message: {
-                Text("All your contacts, messages and keys are erased from this iPhone. Your 12 recovery words will no longer bring them back. Anything still waiting in your mailbox is no longer fetched and expires on its own within 14 days. This cannot be undone.")
-            }
         }
         .presentationBackground(.ultraThinMaterial)
     }
