@@ -2,6 +2,8 @@
 
 # Swell
 
+> **This repository is the archive of Swell 1.2.0 and earlier.** Swell 1.3.0 and later run on the **Swell Protocol** (post-quantum, CryptoKit on iPhone, our own open-source library): [github.com/swellchat/swell-protocol](https://github.com/swellchat/swell-protocol). In 1.3.0, Tor is an optional mode (off by default) and messages go over TLS 1.3 to our mailbox. What the 1.3.0 server can and cannot see: [getswell.org/privacy](https://getswell.org/privacy). The text below describes the old 1.2.0 design.
+
 A private messenger for Android and iPhone. No phone number, no email, no account on our servers.
 
 > **Status:** early. Swell has had an internal security review. It has **not** been independently audited, and builds are not yet reproducible. Do not rely on it where your safety depends on it.
